@@ -23,3 +23,4 @@ PARALLAX scans sysdiagnose files for indicators across multiple exploitation lay
 ## Related
 
 - [AzulMalla](https://github.com/JGoyd/AzulMalla) -- BCM43xx coexistence SRAM vulnerability disclosure and `mesh_detect.py` CLI scanner
+- [ZombieHunter](https://github.com/JGoyd/ZombieHunter) -- iOS silicon implant detector (CVE-2026-20700 SSV persistence)
