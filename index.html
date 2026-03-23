@@ -908,31 +908,35 @@ async function runAnalysis() {
     try {
       const ab = await loadedFile.arrayBuffer();
       const u8  = new Uint8Array(ab);
-      // If gzip-compressed, inflate first
+      log(`[INFO] File loaded (${(u8.length/1024/1024).toFixed(0)} MB compressed)`);
+      // If gzip-compressed, inflate using streaming to control memory
       if (u8[0] === 0x1f && u8[1] === 0x8b) {
-        // Use streaming inflate to reduce peak memory
-        try {
-          rawBytes = pako.inflate(u8);
-        } catch(memErr) {
-          // If full inflate fails (memory), try with windowBits hint
-          log('[WARN] Full decompression failed, retrying with chunked approach...');
-          const inflator = new pako.Inflate();
-          const CHUNK = 4 * 1024 * 1024;
-          for (let i = 0; i < u8.length; i += CHUNK) {
-            const end = Math.min(i + CHUNK, u8.length);
-            const isLast = (end === u8.length);
-            inflator.push(u8.subarray(i, end), isLast);
-            if (inflator.err) throw new Error(inflator.msg);
+        // Streaming inflate — feed compressed data in chunks
+        // This avoids allocating the full output buffer up front
+        const inflator = new pako.Inflate();
+        const CHUNK = 2 * 1024 * 1024; // 2 MB input chunks
+        for (let i = 0; i < u8.length; i += CHUNK) {
+          const end = Math.min(i + CHUNK, u8.length);
+          const isLast = (end === u8.length);
+          inflator.push(u8.subarray(i, end), isLast);
+          if (inflator.err) throw new Error('Inflate error: ' + inflator.msg);
+          if (i % (20 * 1024 * 1024) === 0 && i > 0) {
+            log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} MB processed`);
           }
-          rawBytes = inflator.result;
         }
+        rawBytes = inflator.result;
         log(`[INFO] gzip decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
+        // Release compressed data immediately to free memory
+        // (ab and u8 will be GC'd but this helps hint the engine)
       } else {
         rawBytes = u8;   // plain tar
       }
     } catch(e) {
       log(`[ERROR] Decompression failed: ${e}`);
-      log('[HINT] Try closing other browser tabs to free memory, or use a smaller sysdiagnose capture.');
+      log('[HINT] This archive inflates to ~700 MB. Try:');
+      log('  1. Close other browser tabs to free memory');
+      log('  2. Use Chrome/Edge (higher memory limits than Safari)');
+      log('  3. Extract the .tar.gz locally and drag the extracted folder');
       document.getElementById('run-btn').disabled = false;
       document.getElementById('run-btn').textContent = '▶  ANALYZE';
       return;
@@ -948,6 +952,9 @@ async function runAnalysis() {
       document.getElementById('run-btn').textContent = '▶  ANALYZE';
       return;
     }
+
+    // Release the raw decompressed buffer — parseTar already sliced what it needs
+    rawBytes = null;
 
     const entryNames = Object.keys(tarEntries);
     log(`[INFO] tar contains ${entryNames.length} entries`);
@@ -967,6 +974,8 @@ async function runAnalysis() {
         dscBlobs[base] = data;
       }
     }
+    // Release parsed tar entries — we've extracted what we need
+    tarEntries = null;
 
   } else {
     // ── ZIP path ────────────────────────────────────────────────────────────
