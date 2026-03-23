@@ -1288,10 +1288,13 @@ async function runAnalysis() {
   else result.verdict = 'NO INDICATORS DETECTED — DEVICE APPEARS CLEAN';
 
   // ── L7 DSC Ghost Cache ──
-  // Harvest all 32-char hex UUIDs (no dashes) from tracev3 text logs for cross-reference
+  // Harvest all 32-char hex UUIDs from tracev3 text logs for cross-reference.
+  // IMPORTANT: create a fresh regex per file — global regexes retain lastIndex
+  // across strings and will stall/skip on subsequent iterations.
   const harvestedUUIDs = new Set();
-  const uuidLogRE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|[a-fA-F0-9]{32})\b/g;
   for (const text of Object.values(tracev3Files)) {
+    // Fresh non-global regex each iteration avoids lastIndex carry-over bug
+    const uuidLogRE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|[a-fA-F0-9]{32})\b/g;
     let m;
     while ((m = uuidLogRE.exec(text)) !== null) {
       harvestedUUIDs.add(m[1].toLowerCase().replace(/-/g,''));
@@ -2810,7 +2813,19 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
   const dec = new TextDecoder('ascii', {fatal: false});
   const opUUID = (IOCS.operator_uuid || '977A2253-2A8B-98F7-7FED-C8C71D5150A0').replace(/-/g,'').toUpperCase();
 
+  // Yield control to browser between blobs to prevent UI freeze/crash
+  const yieldToBrowser = () => new Promise(r => setTimeout(r, 0));
+
   for (const [fname, data] of entries) {
+    // Yield every blob — keeps browser responsive on large archives
+    await yieldToBrowser();
+
+    // Skip blobs over 32 MB — no valid DSC implant is this large
+    if (data.length > 32 * 1024 * 1024) {
+      log(`[L7] Skipping oversized blob: ${fname} (${(data.length/1024/1024).toFixed(1)} MB)`);
+      continue;
+    }
+
     const entry = {
       filename: fname,
       size: data.length,
@@ -2843,10 +2858,14 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     }
 
     // ── ASCII text extraction ─────────────────────────────────────────────
-    const text = dec.decode(data);
+    // Cap decode at 4 MB — prevents regex hangs on giant binary blobs
+    const decodeLimit = Math.min(data.length, 4 * 1024 * 1024);
+    const rawSlice = data.subarray ? data.subarray(0, decodeLimit) : data.slice(0, decodeLimit);
+    const text = dec.decode(rawSlice);
     const textLower = text.toLowerCase();
-    const strings = text.match(/[ -~]{6,}/g) || [];
-
+    // Cap printable-string extraction to 2 MB to avoid catastrophic backtrack
+    const strSrc = text.length > 2097152 ? text.slice(0, 2097152) : text;
+    const strings = strSrc.match(/[ -~]{6,}/g) || [];
     // ── Hex-encoded C2 IP detection (Big-Endian sockaddr_in port 443) ─────
     let m2;
     C2_PORT_RE.lastIndex = 0;
