@@ -1860,15 +1860,74 @@ function buildDrillDown(ind, r) {
       if (r.dsc_ghost_entries.length === 0) {
         lines.push('__OK__  No ghost entries detected in DSC blobs');
       }
-      // Per-blob breakdown
+      // Per-blob breakdown — full methodology output
       if (r.dsc_ghost_entries.length > 0) {
         lines.push('__HEAD__Per-Blob Breakdown');
         for (const e of r.dsc_ghost_entries.slice(0, 10)) {
           const implantMark = e.implant ? '__WARN__' : '__OK__';
-          lines.push(`${implantMark}  ${e.filename.slice(0,16)}…  ${e.macho || 'no Mach-O'}  ${e.size.toLocaleString()} bytes`);
-          for (const b of e.bundles.slice(0, 4)) lines.push(`      bundle: ${b}`);
-          for (const h of e.ioc_hits.slice(0, 6)) lines.push(`      hit:    ${h}`);
-          for (const c of (e.clusters||[]).slice(0, 3)) lines.push(`      cluster: [${c.confidence}] ${c.cluster} — ${c.symbol}`);
+          lines.push(`${implantMark}  ${e.filename}  ${e.macho || 'no Mach-O'}  ${(e.size/1024/1024).toFixed(1)} MB`);
+
+          // IOC hits with context windows
+          if (e.ioc_hits.length) {
+            lines.push('__HEAD__IOC Hits');
+            for (const h of e.ioc_hits.slice(0, 10)) lines.push(`__WARN__      ✓ ${h}`);
+          }
+
+          // Symbol clusters
+          if ((e.clusters||[]).length) {
+            lines.push('__HEAD__Symbol Clusters');
+            for (const c of e.clusters.slice(0, 6)) {
+              const mark = c.confidence === 'CRITICAL' ? '__WARN__' : '__OK__';
+              lines.push(`${mark}      [${c.confidence}] ${c.cluster}`);
+              lines.push(`            symbol: ${c.symbol}`);
+            }
+          }
+
+          // Top strings by frequency (analyst review)
+          const strMap = e.string_map || {};
+          const topStrings = Object.entries(strMap)
+            .sort((a,b) => b[1].count - a[1].count)
+            .slice(0, 20);
+          if (topStrings.length) {
+            lines.push('__HEAD__Top Strings by Frequency');
+            for (const [s, info] of topStrings) {
+              const hex = '0x' + info.offset.toString(16).toUpperCase().padStart(8,'0');
+              lines.push(`__OK__      [${String(info.count).padStart(4,' ')}×]  @${hex}  ${s.slice(0,80)}`);
+            }
+          }
+
+          // UUID harvest
+          const uuidH = e.uuid_harvest || {};
+          const topUUIDs = Object.entries(uuidH).sort((a,b) => b[1].count - a[1].count).slice(0,10);
+          if (topUUIDs.length) {
+            lines.push('__HEAD__UUIDs in Binary');
+            for (const [u, info] of topUUIDs) {
+              const hex = '0x' + info.offset.toString(16).toUpperCase().padStart(8,'0');
+              lines.push(`__OK__      [${info.count}×]  @${hex}  ${u}`);
+            }
+          }
+
+          // Domain harvest
+          const domH = e.domain_harvest || {};
+          const topDoms = Object.entries(domH).sort((a,b) => b - a).slice(0,10);
+          if (topDoms.length) {
+            lines.push('__HEAD__Domains in Binary');
+            for (const [d, cnt] of topDoms) {
+              lines.push(`__OK__      [${cnt}×]  ${d}`);
+            }
+          }
+
+          // Non-Apple bundles
+          if (e.bundles.length) {
+            lines.push('__HEAD__Non-Apple Bundle IDs');
+            for (const b of e.bundles.slice(0, 8)) lines.push(`__WARN__      ${b}`);
+          }
+
+          // Suspicious paths
+          if (e.paths.length) {
+            lines.push('__HEAD__Suspicious Paths');
+            for (const p of e.paths.slice(0, 8)) lines.push(`__WARN__      ${p}`);
+          }
         }
       }
       if (ind.status === 'CONFIRMED' || ind.status === 'POSSIBLE') {
@@ -2883,9 +2942,11 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     // Yield every blob — keeps browser responsive on large archives
     await yieldToBrowser();
 
-    // Skip blobs over 32 MB — no valid DSC implant is this large
-    if (data.length > 32 * 1024 * 1024) {
-      log(`[L7] Skipping oversized blob: ${fname} (${(data.length/1024/1024).toFixed(1)} MB)`);
+    // Log blob size so analyst can see what's being scanned
+    log(`[L7] Scanning blob: ${fname} (${(data.length/1024/1024).toFixed(1)} MB)`);
+    // Only skip truly pathological sizes (>512 MB) — real DSC blobs are 150-400 MB
+    if (data.length > 512 * 1024 * 1024) {
+      log(`[L7] Skipping blob over 512 MB: ${fname}`);
       continue;
     }
 
@@ -2920,39 +2981,99 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       }
     }
 
-    // ── Binary string extraction (full file, no size cap) ────────────────
-    // Strategy: scan the raw bytes directly for printable ASCII runs (>=6 chars).
-    // This avoids TextDecoder overhead on huge binaries while still finding all
-    // IOC strings regardless of file size. The C2 IP hex scan also runs on
-    // the full file via a byte-level approach.
-    // Extract printable ASCII runs from full binary (no size cap, byte-level scan)
-    const strings = [];
+    // ── Binary string extraction — methodology per PARALLAX Binary Blob Analysis Module ──
+    // 1. Decode first 4 MB as ASCII for text-based IOC matching (cap prevents hang)
+    // 2. Byte-level scan of FULL file for printable runs — deduped with counts + offsets
+    // 3. Context windows: 60 bytes before/after each IOC hit (hex offset shown)
+    // 4. UUID harvesting: fresh regex per file, deduped with counts
+    // 5. Domain harvesting: from extracted strings, deduped with counts
+    // 6. Raw byte scan of FULL file for C2 IPs (sockaddr_in) — no size limit
+
+    // ── Step 1: ASCII decode (capped at 4 MB for regex-based IOC matching) ──
+    const DECODE_CAP = 4 * 1024 * 1024;
+    const dec4 = new TextDecoder('ascii', {fatal: false});
+    const textSlice = dec4.decode(data.subarray ? data.subarray(0, Math.min(data.length, DECODE_CAP))
+                                                 : data.slice(0, Math.min(data.length, DECODE_CAP)));
+    const text      = textSlice;
+    const textLower = textSlice.toLowerCase();
+
+    // ── Step 2: Full-file byte scan — printable ASCII runs with offsets ──
+    // Never reuse a global regex across files. Yield every 8 MB chunk.
+    const stringMap = {};   // string -> { count, firstOffset }
+    const stringOffsets = {}; // string -> first byte offset (for context window)
     {
-      const MAX_RUN = 512; // cap individual string length; IOC strings are all <100 chars
-      const STR_CHUNK = 8 * 1024 * 1024; // yield every 8 MB
+      const MAX_RUN  = 512;
+      const YIELD_MB = 8 * 1024 * 1024;
       let runStart = -1;
       for (let bi = 0; bi <= data.length; bi++) {
-        if (bi > 0 && bi % STR_CHUNK === 0) await yieldToBrowser();
+        if (bi > 0 && bi % YIELD_MB === 0) await yieldToBrowser();
         const b = data[bi];
         const isPrint = b !== undefined && b >= 0x20 && b <= 0x7e;
         if (isPrint) {
           if (runStart < 0) runStart = bi;
         } else {
           if (runStart >= 0 && bi - runStart >= 6) {
-            // Use a loop instead of spread to avoid stack overflow on large runs
             const end = Math.min(bi, runStart + MAX_RUN);
             let s = '';
             for (let si = runStart; si < end; si++) s += String.fromCharCode(data[si]);
-            strings.push(s);
+            if (stringMap[s]) {
+              stringMap[s].count++;
+            } else {
+              stringMap[s] = { count: 1, offset: runStart };
+            }
           }
           runStart = -1;
         }
       }
     }
-    // Build a joined lowercase text string from extracted printable runs for IOC matching.
-    // Cap at 8 MB joined to avoid excessive memory; IOC strings are short so this is safe.
-    const textLower = strings.join('\0').toLowerCase().slice(0, 8 * 1024 * 1024);
-    const text = strings.join('\0').slice(0, 8 * 1024 * 1024);
+    // Sorted by frequency desc, top 500 for analysis
+    const strings = Object.entries(stringMap)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 500)
+      .map(([s]) => s);
+    entry.string_map = stringMap;  // full map for UI drill-down
+
+    // Context window helper: 60 bytes before + after a byte offset, non-printable → '.'
+    function contextWindow(offset) {
+      const start = Math.max(0, offset - 60);
+      const end   = Math.min(data.length, offset + 60);
+      let ctx = '';
+      for (let ci = start; ci < end; ci++) {
+        const b = data[ci];
+        ctx += (b >= 0x20 && b <= 0x7e) ? String.fromCharCode(b) : '.';
+      }
+      return { hex: '0x' + offset.toString(16).toUpperCase().padStart(8,'0'), ctx };
+    }
+    entry.contextWindow = contextWindow;  // expose for render
+
+    // ── Step 3: UUID harvesting (full decoded text, fresh regex) ──
+    const uuidHarvest = {}; // uuid -> { count, offset }
+    {
+      // Use the 4 MB text slice — UUIDs are short strings, this is fine
+      const UUID_H_RE = /[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}/g;
+      let um;
+      while ((um = UUID_H_RE.exec(textSlice)) !== null) {
+        const u = um[0].toLowerCase();
+        if (uuidHarvest[u]) uuidHarvest[u].count++;
+        else uuidHarvest[u] = { count: 1, offset: um.index };
+      }
+    }
+    entry.uuids = Object.keys(uuidHarvest).slice(0, 100);
+    entry.uuid_harvest = uuidHarvest;
+
+    // ── Step 4: Domain harvesting (from extracted strings) ──
+    const domainHarvest = {};
+    {
+      const DOM_RE = /[a-zA-Z0-9]([a-zA-Z0-9.\-]{1,60})\.(com|net|org|io|ai|xyz|site|app|edu|gov|biz|cc|top|icu|club)/g;
+      const allStrings = Object.keys(stringMap).join('\n');
+      let dm;
+      while ((dm = DOM_RE.exec(allStrings)) !== null) {
+        const d = dm[0].toLowerCase();
+        domainHarvest[d] = (domainHarvest[d] || 0) + 1;
+      }
+    }
+    entry.domain_harvest = domainHarvest;
+    entry.domains = Object.keys(domainHarvest).slice(0, 50);
     // ── Hex-encoded C2 IP detection — raw byte scan (Big-Endian sockaddr_in port 443) ──
     // The sockaddr_in struct is binary, not printable ASCII — must scan raw bytes.
     // Pattern: 4-byte big-endian IP immediately followed by port bytes 0x01 0xbb (443)
@@ -3092,7 +3213,12 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       log(`[L7] IMPLANT: ${fname} — ${entry.macho} + ${entry.ioc_hits.length} IOC hits`);
     }
 
-    if (entry.bundles.length || entry.paths.length || entry.ioc_hits.length || entry.macho) {
+    // Always push if we extracted anything meaningful — analyst decides significance
+    const hasData = entry.bundles.length || entry.paths.length || entry.ioc_hits.length
+      || entry.macho || Object.keys(entry.string_map||{}).length > 0
+      || Object.keys(entry.uuid_harvest||{}).length > 0
+      || Object.keys(entry.domain_harvest||{}).length > 0;
+    if (hasData) {
       ghostEntries.push(entry);
     }
   }
