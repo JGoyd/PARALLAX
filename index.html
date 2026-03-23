@@ -910,13 +910,29 @@ async function runAnalysis() {
       const u8  = new Uint8Array(ab);
       // If gzip-compressed, inflate first
       if (u8[0] === 0x1f && u8[1] === 0x8b) {
-        rawBytes = pako.inflate(u8);
-        log('[INFO] gzip decompressed');
+        // Use streaming inflate to reduce peak memory
+        try {
+          rawBytes = pako.inflate(u8);
+        } catch(memErr) {
+          // If full inflate fails (memory), try with windowBits hint
+          log('[WARN] Full decompression failed, retrying with chunked approach...');
+          const inflator = new pako.Inflate();
+          const CHUNK = 4 * 1024 * 1024;
+          for (let i = 0; i < u8.length; i += CHUNK) {
+            const end = Math.min(i + CHUNK, u8.length);
+            const isLast = (end === u8.length);
+            inflator.push(u8.subarray(i, end), isLast);
+            if (inflator.err) throw new Error(inflator.msg);
+          }
+          rawBytes = inflator.result;
+        }
+        log(`[INFO] gzip decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
       } else {
         rawBytes = u8;   // plain tar
       }
     } catch(e) {
       log(`[ERROR] Decompression failed: ${e}`);
+      log('[HINT] Try closing other browser tabs to free memory, or use a smaller sysdiagnose capture.');
       document.getElementById('run-btn').disabled = false;
       document.getElementById('run-btn').textContent = '▶  ANALYZE';
       return;
