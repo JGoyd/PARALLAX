@@ -1557,9 +1557,72 @@ function renderResults(r) {
   const whatBtn = document.createElement('button');
   whatBtn.id = 'what-btn';
   whatBtn.textContent = 'WHAT IS THIS?';
-  whatBtn.style.cssText = 'margin-left:10px;background:var(--panel);color:var(--dim);border:1px solid var(--border);font-family:var(--mono);font-size:11px;padding:8px 18px;cursor:pointer;';
-  whatBtn.onclick = () => window.open('mailto:fr0mthecloud@proton.me', '_blank');
+  whatBtn.style.cssText = 'margin-left:10px;background:var(--panel);color:var(--dim);border:1px solid var(--border);font-family:var(--mono);font-size:11px;padding:8px 18px;cursor:pointer;letter-spacing:0.05em;';
+  whatBtn.onclick = () => showWhatIsThis();
   el.appendChild(whatBtn);
+}
+
+function showWhatIsThis() {
+  // Remove any existing modal
+  const existing = document.getElementById('parallax-modal');
+  if (existing) { existing.remove(); return; }
+
+  const overlay = document.createElement('div');
+  overlay.id = 'parallax-modal';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;';
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#1a1c1a;border:1px solid #2e312e;max-width:560px;width:100%;padding:32px;font-family:Courier New,monospace;color:#edeae3;position:relative;max-height:85vh;overflow-y:auto;';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '×';
+  closeBtn.style.cssText = 'position:absolute;top:12px;right:16px;background:none;border:none;color:#7a7d76;font-size:20px;cursor:pointer;font-family:inherit;line-height:1;';
+  closeBtn.onclick = () => overlay.remove();
+  box.appendChild(closeBtn);
+
+  const sections = [
+    {
+      head: 'PARALLAX',
+      body: 'A forensic analysis tool for iOS sysdiagnose archives. It reads the diagnostic data your iPhone generates internally and checks it against known indicators of covert monitoring activity — things that would not show up in normal security scans.'
+    },
+    {
+      head: 'WHAT IT ANALYZES',
+      body: 'You give it a sysdiagnose file (.tar.gz) generated on your iPhone. It runs entirely in your browser — no data is sent anywhere. It checks 8 layers of the operating system: hardware access, cellular identity, app permissions, data collection patterns, outbound routing, relay infrastructure, diagnostic suppression, and hidden executable code.'
+    },
+    {
+      head: 'WHAT THE RESULTS MEAN',
+      body: 'CONFIRMED means the indicator was found clearly in your logs. POSSIBLE means it was partially present. NOT DETECTED means no evidence was found at that layer. A high confirmed count does not necessarily mean your device is compromised — it means the indicators were present. A researcher or forensic professional should review the full report before drawing conclusions.'
+    },
+    {
+      head: 'HOW TO GET A SYSDIAGNOSE',
+      body: 'On your iPhone: hold Volume Up + Volume Down + Side Button simultaneously for 1–2 seconds, then release. Wait 5–10 minutes. Go to Settings → Privacy → Analytics → Analytics Data and look for a file starting with “sysdiagnose”. Share it to your computer, then drop it here.'
+    },
+    {
+      head: 'QUESTIONS OR FINDINGS',
+      body: 'If you have results you want reviewed, or questions about what was found, contact the researcher directly.'
+    },
+  ];
+
+  for (const sec of sections) {
+    const h = document.createElement('div');
+    h.style.cssText = 'font-size:10px;letter-spacing:0.12em;color:#7b9e7b;margin-top:22px;margin-bottom:6px;';
+    h.textContent = sec.head;
+    box.appendChild(h);
+    const p = document.createElement('div');
+    p.style.cssText = 'font-size:12px;line-height:1.7;color:#b8c4b0;';
+    p.textContent = sec.body;
+    box.appendChild(p);
+  }
+
+  const contactBtn = document.createElement('a');
+  contactBtn.href = 'mailto:fr0mthecloud@proton.me';
+  contactBtn.textContent = 'fr0mthecloud@proton.me';
+  contactBtn.style.cssText = 'display:inline-block;margin-top:20px;color:#2db868;font-size:11px;text-decoration:none;border:1px solid #2e312e;padding:8px 16px;letter-spacing:0.06em;';
+  box.appendChild(contactBtn);
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
 }
 
 function rule(parent, label) {
@@ -2857,26 +2920,73 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       }
     }
 
-    // ── ASCII text extraction ─────────────────────────────────────────────
-    // Cap decode at 4 MB — prevents regex hangs on giant binary blobs
-    const decodeLimit = Math.min(data.length, 4 * 1024 * 1024);
-    const rawSlice = data.subarray ? data.subarray(0, decodeLimit) : data.slice(0, decodeLimit);
-    const text = dec.decode(rawSlice);
-    const textLower = text.toLowerCase();
-    // Cap printable-string extraction to 2 MB to avoid catastrophic backtrack
-    const strSrc = text.length > 2097152 ? text.slice(0, 2097152) : text;
-    const strings = strSrc.match(/[ -~]{6,}/g) || [];
-    // ── Hex-encoded C2 IP detection (Big-Endian sockaddr_in port 443) ─────
+    // ── Binary string extraction (full file, no size cap) ────────────────
+    // Strategy: scan the raw bytes directly for printable ASCII runs (>=6 chars).
+    // This avoids TextDecoder overhead on huge binaries while still finding all
+    // IOC strings regardless of file size. The C2 IP hex scan also runs on
+    // the full file via a byte-level approach.
+    // Extract printable ASCII runs from full binary (no size cap, byte-level scan)
+    const strings = [];
+    {
+      const MAX_RUN = 512; // cap individual string length; IOC strings are all <100 chars
+      const STR_CHUNK = 8 * 1024 * 1024; // yield every 8 MB
+      let runStart = -1;
+      for (let bi = 0; bi <= data.length; bi++) {
+        if (bi > 0 && bi % STR_CHUNK === 0) await yieldToBrowser();
+        const b = data[bi];
+        const isPrint = b !== undefined && b >= 0x20 && b <= 0x7e;
+        if (isPrint) {
+          if (runStart < 0) runStart = bi;
+        } else {
+          if (runStart >= 0 && bi - runStart >= 6) {
+            // Use a loop instead of spread to avoid stack overflow on large runs
+            const end = Math.min(bi, runStart + MAX_RUN);
+            let s = '';
+            for (let si = runStart; si < end; si++) s += String.fromCharCode(data[si]);
+            strings.push(s);
+          }
+          runStart = -1;
+        }
+      }
+    }
+    // Build a joined lowercase text string from extracted printable runs for IOC matching.
+    // Cap at 8 MB joined to avoid excessive memory; IOC strings are short so this is safe.
+    const textLower = strings.join('\0').toLowerCase().slice(0, 8 * 1024 * 1024);
+    const text = strings.join('\0').slice(0, 8 * 1024 * 1024);
+    // ── Hex-encoded C2 IP detection — raw byte scan (Big-Endian sockaddr_in port 443) ──
+    // The sockaddr_in struct is binary, not printable ASCII — must scan raw bytes.
+    // Pattern: 4-byte big-endian IP immediately followed by port bytes 0x01 0xbb (443)
+    // OR preceded by 0x02 0x00 0x01 0xbb (AF_INET + port 443 in network order)
+    const seenIPs = new Set();
+    // Scan raw bytes for sockaddr_in structs (port 443 = 0x01 0xbb)
+    // Yield every 4 MB chunk to keep the browser responsive
+    const CHUNK = 4 * 1024 * 1024;
+    for (let bi = 0; bi <= data.length - 6; bi++) {
+      if (bi > 0 && bi % CHUNK === 0) await yieldToBrowser();
+      if (data[bi+4] === 0x01 && data[bi+5] === 0xbb) {
+        const ip = `${data[bi]}.${data[bi+1]}.${data[bi+2]}.${data[bi+3]}`;
+        if (isPublicIP(ip) && !seenIPs.has(ip)) {
+          seenIPs.add(ip);
+          const note = knownC2IPs[ip] || '';
+          const conf = knownC2IPs[ip] ? 'CRITICAL' : 'HIGH';
+          entry.ioc_hits.push(`Hex-IP C2: ${ip}${note ? ' — '+note : ''}`);
+          c2IPHits.push({ fname, ip, note, confidence: conf });
+          log(`[L7] Hex-IP C2 (raw): ${ip} in ${fname}`);
+        }
+      }
+    }
+    // Also scan the printable text for any hex-encoded IP strings (belt-and-suspenders)
     let m2;
     C2_PORT_RE.lastIndex = 0;
     while ((m2 = C2_PORT_RE.exec(textLower)) !== null) {
       const ip = hexToIP(m2[1]);
-      if (isPublicIP(ip)) {
+      if (isPublicIP(ip) && !seenIPs.has(ip)) {
+        seenIPs.add(ip);
         const note = knownC2IPs[ip] || '';
         const conf = knownC2IPs[ip] ? 'CRITICAL' : 'HIGH';
-        entry.ioc_hits.push(`Hex-IP C2: ${ip}${note ? ' — '+note : ''}`);
+        entry.ioc_hits.push(`Hex-IP C2 (encoded): ${ip}${note ? ' — '+note : ''}`);
         c2IPHits.push({ fname, ip, note, confidence: conf });
-        log(`[L7] Hex-IP C2: ${ip} in ${fname}`);
+        log(`[L7] Hex-IP C2 (encoded): ${ip} in ${fname}`);
       }
     }
 
