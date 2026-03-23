@@ -2903,7 +2903,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
   }
   function isPublicIP(ip) {
     if (!ip) return false;
-    const PRIV = ['0.0.0.0','255.255.255.255','127.','10.','192.168.','172.16.','172.17.','172.18.','172.19.','172.2','172.3.'];
+    const PRIV = ['0.','255.255.255.255','127.','10.','192.168.','172.16.','172.17.','172.18.','172.19.','172.2','172.3.'];
     return !PRIV.some(p => ip.startsWith(p));
   }
 
@@ -3160,7 +3160,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       let um;
       while ((um = UUID_SCAN_RE.exec(textLower)) !== null) {
         const u = um[0];
-        if (harvestedUUIDs.has(u)) {
+        if (harvestedUUIDs.has(u) && u.replace(/[0-]/g,'').length > 0) {
           entry.ioc_hits.push(`UUID cross-ref: ${u} (seen in tracev3 AND DSC binary)`);
           uuidCrossrefs.push({ fname, uuid: u });
           break; // one per blob is enough to flag it
