@@ -3053,19 +3053,17 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     const text      = textSlice;
     const textLower = textSlice.toLowerCase();
 
-    // ── Step 2: Full-file byte scan — printable ASCII runs with offsets ──
-    // Never reuse a global regex across files. Yield every 8 MB chunk.
-    const stringMap = {};   // string -> { count, firstOffset }
-    const stringOffsets = {}; // string -> first byte offset (for context window)
+    // ── Step 2: Byte scan for printable ASCII runs — capped at 8 MB for large blobs ──
+    const stringMap = {};
     {
       const MAX_RUN  = 512;
-      const YIELD_MB = 8 * 1024 * 1024;
+      const SCAN_CAP = Math.min(data.length, 8 * 1024 * 1024);
+      const YIELD_EVERY = 2 * 1024 * 1024;
       let runStart = -1;
-      for (let bi = 0; bi <= data.length; bi++) {
-        if (bi > 0 && bi % YIELD_MB === 0) await yieldToBrowser();
-        const b = data[bi];
-        const isPrint = b !== undefined && b >= 0x20 && b <= 0x7e;
-        if (isPrint) {
+      for (let bi = 0; bi <= SCAN_CAP; bi++) {
+        if (bi > 0 && bi % YIELD_EVERY === 0) await yieldToBrowser();
+        const b = bi < data.length ? data[bi] : 0;
+        if (b >= 0x20 && b <= 0x7e) {
           if (runStart < 0) runStart = bi;
         } else {
           if (runStart >= 0 && bi - runStart >= 6) {
@@ -3082,12 +3080,16 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
         }
       }
     }
-    // Sorted by frequency desc, top 500 for analysis
     const strings = Object.entries(stringMap)
       .sort((a, b) => b[1].count - a[1].count)
       .slice(0, 500)
       .map(([s]) => s);
-    entry.string_map = stringMap;  // full map for UI drill-down
+    entry.string_count = Object.keys(stringMap).length;
+    // Keep only top 30 strings for UI drill-down (not full map — saves memory)
+    const topEntries = Object.entries(stringMap)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 30);
+    entry.string_map = Object.fromEntries(topEntries);
 
     // Context window helper: 60 bytes before + after a byte offset, non-printable → '.'
     function contextWindow(offset) {
@@ -3272,7 +3274,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
 
     // Always push if we extracted anything meaningful — analyst decides significance
     const hasData = entry.bundles.length || entry.paths.length || entry.ioc_hits.length
-      || entry.macho || Object.keys(entry.string_map||{}).length > 0
+      || entry.macho || (entry.string_count||0) > 0
       || Object.keys(entry.uuid_harvest||{}).length > 0
       || Object.keys(entry.domain_harvest||{}).length > 0;
     if (hasData) {
