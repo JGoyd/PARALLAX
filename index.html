@@ -3080,9 +3080,10 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     // OR preceded by 0x02 0x00 0x01 0xbb (AF_INET + port 443 in network order)
     const seenIPs = new Set();
     // Scan raw bytes for sockaddr_in structs (port 443 = 0x01 0xbb)
-    // Yield every 4 MB chunk to keep the browser responsive
-    const CHUNK = 4 * 1024 * 1024;
-    for (let bi = 0; bi <= data.length - 6; bi++) {
+    // Cap scan at 8 MB to prevent browser hang on huge blobs
+    const scanLimit = Math.min(data.length - 6, 8 * 1024 * 1024);
+    const CHUNK = 1024 * 1024;
+    for (let bi = 0; bi <= scanLimit; bi++) {
       if (bi > 0 && bi % CHUNK === 0) await yieldToBrowser();
       if (data[bi+4] === 0x01 && data[bi+5] === 0xbb) {
         const ip = `${data[bi]}.${data[bi+1]}.${data[bi+2]}.${data[bi+3]}`;
