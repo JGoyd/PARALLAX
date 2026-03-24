@@ -864,14 +864,30 @@ async function runAnalysis() {
   await updateIOCs();
   log(`[START] ${loadedFile.name}`);
 
-  // ── Minimal POSIX ustar tar parser ─────────────────────────────────────────
+  // ── Tar helpers ──────────────────────────────────────────────────────────────
+  function readStr(u8, start, len) {
+    let end = start;
+    while (end < start + len && u8[end] !== 0) end++;
+    return new TextDecoder('ascii', {fatal:false}).decode(u8.slice(start, end));
+  }
+  const WANTED_TEXT_FILES = new Set([
+    'pmudiagnose.txt', 'ps.txt', 'jetsam_priority.csv',
+    'taskSummary.csv', 'mount.txt'
+  ]);
+  function isWantedEntry(fullName) {
+    const base = fullName.split('/').pop();
+    if (base.endsWith('.tracev3')) return true;
+    if (WANTED_TEXT_FILES.has(base)) return true;
+    if (fullName.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) return true;
+    return false;
+  }
+  // Selective tar parser — only slices wanted files, skips everything else
   function parseTar(buffer) {
     const files = {};
     const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     let offset = 0;
     while (offset + 512 <= u8.length) {
-      const header = u8.slice(offset, offset + 512);
-      // End-of-archive: two 512-byte zero blocks
+      const header = u8.subarray(offset, offset + 512);
       if (header.every(b => b === 0)) break;
       const name    = readStr(header, 0,   100);
       const prefix  = readStr(header, 345, 155);
@@ -880,22 +896,18 @@ async function runAnalysis() {
       const fullName = (prefix ? prefix + '/' : '') + name;
       const size    = parseInt(sizeOct.trim() || '0', 8) || 0;
       offset += 512;
-      if (type === '0' || type === '' || type === '\0') {
+      if ((type === '0' || type === '' || type === '\0') && size > 0 && isWantedEntry(fullName)) {
         files[fullName] = u8.slice(offset, offset + size);
       }
       offset += Math.ceil(size / 512) * 512;
     }
     return files;
   }
-  function readStr(u8, start, len) {
-    let end = start;
-    while (end < start + len && u8[end] !== 0) end++;
-    return new TextDecoder('ascii', {fatal:false}).decode(u8.slice(start, end));
-  }
 
   // ── Extract archive (tar.gz or zip) ──────────────────────────────────────
   const tracev3Files = {};
   const dscBlobs = {};   // UUID-hex filename -> Uint8Array
+  const extraTextFiles = {}; // ps.txt, jetsam_priority.csv, etc.
   let pmuText = null;
 
   const fname = loadedFile.name.toLowerCase();
@@ -906,23 +918,44 @@ async function runAnalysis() {
     log('[INFO] Detected tar.gz archive — decompressing...');
     let rawBytes;
     try {
-      const ab = await loadedFile.arrayBuffer();
-      const u8  = new Uint8Array(ab);
-      // If gzip-compressed, inflate first
+      // Read file into memory, check if gzip
+      let u8 = new Uint8Array(await loadedFile.arrayBuffer());
+      const sizeMB = (u8.length/1024/1024).toFixed(0);
+      log(`[INFO] File loaded (${sizeMB} MB compressed)`);
+
       if (u8[0] === 0x1f && u8[1] === 0x8b) {
-        rawBytes = pako.inflate(u8);
-        log('[INFO] gzip decompressed');
+        log('[INFO] Decompressing...');
+        const inflator = new pako.Inflate();
+        const CHUNK = 2 * 1024 * 1024;
+        for (let i = 0; i < u8.length; i += CHUNK) {
+          const end = Math.min(i + CHUNK, u8.length);
+          inflator.push(u8.subarray(i, end), end === u8.length);
+          if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
+          if (i % (20*1024*1024) === 0 && i > 0) {
+            log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} / ${sizeMB} MB`);
+          }
+        }
+        rawBytes = inflator.result;
+        // Release compressed buffer immediately — we only need the decompressed tar now
+        u8 = null;
+        loadedFile = null;
+        log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
       } else {
-        rawBytes = u8;   // plain tar
+        rawBytes = u8;
+        u8 = null;
       }
     } catch(e) {
       log(`[ERROR] Decompression failed: ${e}`);
+      log('[HINT] This archive may be too large for browser memory. Try:');
+      log('  1. Close ALL other browser tabs');
+      log('  2. Decompress locally: tar -xzf file.tar.gz');
+      log('     Then drag the extracted folder or individual .tracev3 files');
       document.getElementById('run-btn').disabled = false;
       document.getElementById('run-btn').textContent = '▶  ANALYZE';
       return;
     }
 
-    log('[INFO] Parsing tar...');
+    log('[INFO] Extracting relevant files...');
     let tarEntries;
     try {
       tarEntries = parseTar(rawBytes);
@@ -933,6 +966,9 @@ async function runAnalysis() {
       return;
     }
 
+    // Release the decompressed buffer — parseTar already sliced what it needs
+    rawBytes = null;
+
     const entryNames = Object.keys(tarEntries);
     log(`[INFO] tar contains ${entryNames.length} entries`);
     const decoder = new TextDecoder('utf-8', {fatal: false});
@@ -942,15 +978,16 @@ async function runAnalysis() {
       const data = tarEntries[name];
       if (base.endsWith('.tracev3')) {
         tracev3Files[base] = decoder.decode(data);
-      }
-      if (base === 'pmudiagnose.txt') {
+      } else if (base === 'pmudiagnose.txt') {
         pmuText = decoder.decode(data);
-      }
-      // DSC ghost cache blobs: dsc/<32-hex-char filename>
-      if (name.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
+      } else if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
+        extraTextFiles[base] = decoder.decode(data);
+      } else if (name.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
         dscBlobs[base] = data;
       }
     }
+    // Release parsed tar entries — we've extracted what we need
+    tarEntries = null;
 
   } else {
     // ── ZIP path ────────────────────────────────────────────────────────────
@@ -986,6 +1023,9 @@ async function runAnalysis() {
       }
       if (base === 'pmudiagnose.txt') {
         try { pmuText = await entry.async('text'); } catch(e) { /* skip */ }
+      }
+      if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
+        try { extraTextFiles[base] = await entry.async('text'); } catch(e) { /* skip */ }
       }
       // DSC ghost cache blobs
       if (name.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
@@ -1177,6 +1217,44 @@ async function runAnalysis() {
     l3bStatus, 0, l3bParts.join(' · ') || 'ciphermld not detected');
   log(`[L3b] ${l3bStatus}`);
 
+  // ── L4 Process / System Corroboration ──────────────────────────────────
+  log('[L4] Process and system state...');
+  const l4parts = [];
+  let l4status = 'NOT_DETECTED';
+  const psText = extraTextFiles['ps.txt'] || '';
+  if (psText) {
+    const psLines = psText.split('\n');
+    const nspLine = psLines.find(l => l.includes('networkserviceproxy'));
+    if (nspLine) {
+      const pidMatch = nspLine.match(/\s+(\d+)\s+/);
+      l4parts.push(`networkserviceproxy running (PID ${pidMatch ? pidMatch[1] : '?'})`);
+    }
+    if (psLines.some(l => /nsproxy|NSProxy/i.test(l) && !l.includes('networkserviceproxy'))) {
+      l4parts.push('NSProxy PacketTunnel process detected');
+      l4status = 'CONFIRMED';
+    }
+    if (psLines.some(l => l.includes('ciphermld'))) {
+      l4parts.push('ciphermld active at capture');
+      l4status = 'CONFIRMED';
+    }
+  } else { l4parts.push('ps.txt not found'); }
+  const jetsamText = extraTextFiles['jetsam_priority.csv'] || '';
+  if (jetsamText) {
+    const nspJet = jetsamText.split('\n').find(l => l.includes('networkserviceproxy'));
+    if (nspJet) {
+      const cols = nspJet.split(',');
+      l4parts.push(`NSP jetsam priority ${(cols[0]||'?').trim()}`);
+    }
+    const suspJet = jetsamText.split('\n').filter(l => /nsproxy|NSProxy|FEEDEEEE/i.test(l) && !l.includes('networkserviceproxy'));
+    if (suspJet.length) { l4parts.push(`${suspJet.length} suspicious process(es) in jetsam`); l4status = 'CONFIRMED'; }
+  }
+  if (l4status === 'NOT_DETECTED' && psText.includes('networkserviceproxy') && l3bStatus === 'CONFIRMED') {
+    l4status = 'POSSIBLE';
+  }
+  addIndicator(result, 'L4', 'Process / System Corroboration',
+    l4status, 0, l4parts.join(' · ') || 'System state files not available');
+  log(`[L4] ${l4status}`);
+
   // ── L5 Egress ──
   log('[L5] Active egress / relay nodes...');
   let ohfFiles=[], c2Hits={}, kayleesF=[];
@@ -1288,10 +1366,13 @@ async function runAnalysis() {
   else result.verdict = 'NO INDICATORS DETECTED — DEVICE APPEARS CLEAN';
 
   // ── L7 DSC Ghost Cache ──
-  // Harvest all 32-char hex UUIDs (no dashes) from tracev3 text logs for cross-reference
+  // Harvest all 32-char hex UUIDs from tracev3 text logs for cross-reference.
+  // IMPORTANT: create a fresh regex per file — global regexes retain lastIndex
+  // across strings and will stall/skip on subsequent iterations.
   const harvestedUUIDs = new Set();
-  const uuidLogRE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|[a-fA-F0-9]{32})\b/g;
   for (const text of Object.values(tracev3Files)) {
+    // Fresh non-global regex each iteration avoids lastIndex carry-over bug
+    const uuidLogRE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|[a-fA-F0-9]{32})\b/g;
     let m;
     while ((m = uuidLogRE.exec(text)) !== null) {
       harvestedUUIDs.add(m[1].toLowerCase().replace(/-/g,''));
@@ -1554,9 +1635,72 @@ function renderResults(r) {
   const whatBtn = document.createElement('button');
   whatBtn.id = 'what-btn';
   whatBtn.textContent = 'WHAT IS THIS?';
-  whatBtn.style.cssText = 'margin-left:10px;background:var(--panel);color:var(--dim);border:1px solid var(--border);font-family:var(--mono);font-size:11px;padding:8px 18px;cursor:pointer;';
-  whatBtn.onclick = () => window.open('mailto:fr0mthecloud@proton.me', '_blank');
+  whatBtn.style.cssText = 'margin-left:10px;background:var(--panel);color:var(--dim);border:1px solid var(--border);font-family:var(--mono);font-size:11px;padding:8px 18px;cursor:pointer;letter-spacing:0.05em;';
+  whatBtn.onclick = () => showWhatIsThis();
   el.appendChild(whatBtn);
+}
+
+function showWhatIsThis() {
+  // Remove any existing modal
+  const existing = document.getElementById('parallax-modal');
+  if (existing) { existing.remove(); return; }
+
+  const overlay = document.createElement('div');
+  overlay.id = 'parallax-modal';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;';
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#1a1c1a;border:1px solid #2e312e;max-width:560px;width:100%;padding:32px;font-family:Courier New,monospace;color:#edeae3;position:relative;max-height:85vh;overflow-y:auto;';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '×';
+  closeBtn.style.cssText = 'position:absolute;top:12px;right:16px;background:none;border:none;color:#7a7d76;font-size:20px;cursor:pointer;font-family:inherit;line-height:1;';
+  closeBtn.onclick = () => overlay.remove();
+  box.appendChild(closeBtn);
+
+  const sections = [
+    {
+      head: 'PARALLAX',
+      body: 'A forensic analysis tool for iOS sysdiagnose archives. It reads the diagnostic data your iPhone generates internally and checks it against known indicators of covert monitoring activity — things that would not show up in normal security scans.'
+    },
+    {
+      head: 'WHAT IT ANALYZES',
+      body: 'You give it a sysdiagnose file (.tar.gz) generated on your iPhone. It runs entirely in your browser — no data is sent anywhere. It checks 8 layers of the operating system: hardware access, cellular identity, app permissions, data collection patterns, outbound routing, relay infrastructure, diagnostic suppression, and hidden executable code.'
+    },
+    {
+      head: 'WHAT THE RESULTS MEAN',
+      body: 'CONFIRMED means the indicator was found clearly in your logs. POSSIBLE means it was partially present. NOT DETECTED means no evidence was found at that layer. A high confirmed count does not necessarily mean your device is compromised — it means the indicators were present. A researcher or forensic professional should review the full report before drawing conclusions.'
+    },
+    {
+      head: 'HOW TO GET A SYSDIAGNOSE',
+      body: 'On your iPhone: hold Volume Up + Volume Down + Side Button simultaneously for 1–2 seconds, then release. Wait 5–10 minutes. Go to Settings → Privacy → Analytics → Analytics Data and look for a file starting with “sysdiagnose”. Share it to your computer, then drop it here.'
+    },
+    {
+      head: 'QUESTIONS OR FINDINGS',
+      body: 'If you have results you want reviewed, or questions about what was found, contact the researcher directly.'
+    },
+  ];
+
+  for (const sec of sections) {
+    const h = document.createElement('div');
+    h.style.cssText = 'font-size:10px;letter-spacing:0.12em;color:#7b9e7b;margin-top:22px;margin-bottom:6px;';
+    h.textContent = sec.head;
+    box.appendChild(h);
+    const p = document.createElement('div');
+    p.style.cssText = 'font-size:12px;line-height:1.7;color:#b8c4b0;';
+    p.textContent = sec.body;
+    box.appendChild(p);
+  }
+
+  const contactBtn = document.createElement('a');
+  contactBtn.href = 'mailto:fr0mthecloud@proton.me';
+  contactBtn.textContent = 'fr0mthecloud@proton.me';
+  contactBtn.style.cssText = 'display:inline-block;margin-top:20px;color:#2db868;font-size:11px;text-decoration:none;border:1px solid #2e312e;padding:8px 16px;letter-spacing:0.06em;';
+  box.appendChild(contactBtn);
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
 }
 
 function rule(parent, label) {
@@ -1679,6 +1823,12 @@ function buildDrillDown(ind, r) {
         lines.push('__LEGAL_START__CFAA 18 U.S.C. §1030: unauthorized data transmission from a protected computer. GDPR Article 44: cross-border transfers to unknown relay nodes have no legal basis or data transfer agreement.');
       }
       break;
+    case 'L4':
+      if (ind.status !== 'NOT_DETECTED') {
+        lines.push('__HEAD__Process & System State at Capture');
+        lines.push('__PLAIN__At the moment this diagnostic was captured, surveillance-related processes were confirmed running on the device with no user interaction.');
+      }
+      break;
     case 'L5':
       lines.push('__RELAY_VIZ__');
       break;
@@ -1794,15 +1944,61 @@ function buildDrillDown(ind, r) {
       if (r.dsc_ghost_entries.length === 0) {
         lines.push('__OK__  No ghost entries detected in DSC blobs');
       }
-      // Per-blob breakdown
+      // Per-blob breakdown — full methodology output
       if (r.dsc_ghost_entries.length > 0) {
         lines.push('__HEAD__Per-Blob Breakdown');
         for (const e of r.dsc_ghost_entries.slice(0, 10)) {
           const implantMark = e.implant ? '__WARN__' : '__OK__';
-          lines.push(`${implantMark}  ${e.filename.slice(0,16)}…  ${e.macho || 'no Mach-O'}  ${e.size.toLocaleString()} bytes`);
-          for (const b of e.bundles.slice(0, 4)) lines.push(`      bundle: ${b}`);
-          for (const h of e.ioc_hits.slice(0, 6)) lines.push(`      hit:    ${h}`);
-          for (const c of (e.clusters||[]).slice(0, 3)) lines.push(`      cluster: [${c.confidence}] ${c.cluster} — ${c.symbol}`);
+          lines.push(`${implantMark}  ${e.filename}  ${e.macho || 'no Mach-O'}  ${(e.size/1024/1024).toFixed(1)} MB`);
+
+          // IOC hits with context windows
+          if (e.ioc_hits.length) {
+            lines.push('__HEAD__IOC Hits');
+            for (const h of e.ioc_hits.slice(0, 10)) lines.push(`__WARN__      ✓ ${h}`);
+          }
+
+          // Symbol clusters
+          if ((e.clusters||[]).length) {
+            lines.push('__HEAD__Symbol Clusters');
+            for (const c of e.clusters.slice(0, 6)) {
+              const mark = c.confidence === 'CRITICAL' ? '__WARN__' : '__OK__';
+              lines.push(`${mark}      [${c.confidence}] ${c.cluster}`);
+              lines.push(`            symbol: ${c.symbol}`);
+            }
+          }
+
+          // UUID harvest
+          const uuidH = e.uuid_harvest || {};
+          const topUUIDs = Object.entries(uuidH).sort((a,b) => b[1].count - a[1].count).slice(0,10);
+          if (topUUIDs.length) {
+            lines.push('__HEAD__UUIDs in Binary');
+            for (const [u, info] of topUUIDs) {
+              const hex = '0x' + info.offset.toString(16).toUpperCase().padStart(8,'0');
+              lines.push(`__OK__      [${info.count}×]  @${hex}  ${u}`);
+            }
+          }
+
+          // Domain harvest
+          const domH = e.domain_harvest || {};
+          const topDoms = Object.entries(domH).sort((a,b) => b - a).slice(0,10);
+          if (topDoms.length) {
+            lines.push('__HEAD__Domains in Binary');
+            for (const [d, cnt] of topDoms) {
+              lines.push(`__OK__      [${cnt}×]  ${d}`);
+            }
+          }
+
+          // Non-Apple bundles
+          if (e.bundles.length) {
+            lines.push('__HEAD__Non-Apple Bundle IDs');
+            for (const b of e.bundles.slice(0, 8)) lines.push(`__WARN__      ${b}`);
+          }
+
+          // Suspicious paths
+          if (e.paths.length) {
+            lines.push('__HEAD__Suspicious Paths');
+            for (const p of e.paths.slice(0, 8)) lines.push(`__WARN__      ${p}`);
+          }
         }
       }
       if (ind.status === 'CONFIRMED' || ind.status === 'POSSIBLE') {
@@ -2372,6 +2568,7 @@ function getLayerPlainName(layer) {
     L2: 'App permissions overridden without your knowledge',
     L3a: 'Silent data collection identity running on your device',
     L3b: 'Hidden outbound data pipe sending your data out',
+    L4: 'Surveillance processes confirmed running at capture time',
     L5: 'Active connections to known surveillance relay servers',
     L6: 'Diagnostic logs being falsified to hide activity',
     L7: 'Unknown executable code hidden in system cache',
@@ -2778,7 +2975,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
   }
   function isPublicIP(ip) {
     if (!ip) return false;
-    const PRIV = ['0.0.0.0','255.255.255.255','127.','10.','192.168.','172.16.','172.17.','172.18.','172.19.','172.2','172.3.'];
+    const PRIV = ['0.','255.255.255.255','127.','10.','192.168.','172.16.','172.17.','172.18.','172.19.','172.2','172.3.'];
     return !PRIV.some(p => ip.startsWith(p));
   }
 
@@ -2810,7 +3007,21 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
   const dec = new TextDecoder('ascii', {fatal: false});
   const opUUID = (IOCS.operator_uuid || '977A2253-2A8B-98F7-7FED-C8C71D5150A0').replace(/-/g,'').toUpperCase();
 
+  // Yield control to browser between blobs to prevent UI freeze/crash
+  const yieldToBrowser = () => new Promise(r => setTimeout(r, 0));
+
   for (const [fname, data] of entries) {
+    // Yield every blob — keeps browser responsive on large archives
+    await yieldToBrowser();
+
+    // Log blob size so analyst can see what's being scanned
+    log(`[L7] Scanning blob: ${fname} (${(data.length/1024/1024).toFixed(1)} MB)`);
+    // Only skip truly pathological sizes (>512 MB) — real DSC blobs are 150-400 MB
+    if (data.length > 512 * 1024 * 1024) {
+      log(`[L7] Skipping blob over 512 MB: ${fname}`);
+      continue;
+    }
+
     const entry = {
       filename: fname,
       size: data.length,
@@ -2842,22 +3053,131 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       }
     }
 
-    // ── ASCII text extraction ─────────────────────────────────────────────
-    const text = dec.decode(data);
-    const textLower = text.toLowerCase();
-    const strings = text.match(/[ -~]{6,}/g) || [];
+    // ── Binary string extraction — methodology per PARALLAX Binary Blob Analysis Module ──
+    // 1. Decode first 4 MB as ASCII for text-based IOC matching (cap prevents hang)
+    // 2. Byte-level scan of FULL file for printable runs — deduped with counts + offsets
+    // 3. Context windows: 60 bytes before/after each IOC hit (hex offset shown)
+    // 4. UUID harvesting: fresh regex per file, deduped with counts
+    // 5. Domain harvesting: from extracted strings, deduped with counts
+    // 6. Raw byte scan of FULL file for C2 IPs (sockaddr_in) — no size limit
 
-    // ── Hex-encoded C2 IP detection (Big-Endian sockaddr_in port 443) ─────
+    // ── Step 1: ASCII decode (capped at 4 MB for regex-based IOC matching) ──
+    const DECODE_CAP = 4 * 1024 * 1024;
+    const dec4 = new TextDecoder('ascii', {fatal: false});
+    const textSlice = dec4.decode(data.subarray ? data.subarray(0, Math.min(data.length, DECODE_CAP))
+                                                 : data.slice(0, Math.min(data.length, DECODE_CAP)));
+    const text      = textSlice;
+    const textLower = textSlice.toLowerCase();
+
+    // ── Step 2: Byte scan for printable ASCII runs — capped at 8 MB for large blobs ──
+    const stringMap = {};
+    {
+      const MAX_RUN  = 512;
+      const SCAN_CAP = Math.min(data.length, 8 * 1024 * 1024);
+      const YIELD_EVERY = 2 * 1024 * 1024;
+      let runStart = -1;
+      for (let bi = 0; bi <= SCAN_CAP; bi++) {
+        if (bi > 0 && bi % YIELD_EVERY === 0) await yieldToBrowser();
+        const b = bi < data.length ? data[bi] : 0;
+        if (b >= 0x20 && b <= 0x7e) {
+          if (runStart < 0) runStart = bi;
+        } else {
+          if (runStart >= 0 && bi - runStart >= 6) {
+            const end = Math.min(bi, runStart + MAX_RUN);
+            let s = '';
+            for (let si = runStart; si < end; si++) s += String.fromCharCode(data[si]);
+            if (stringMap[s]) {
+              stringMap[s].count++;
+            } else {
+              stringMap[s] = { count: 1, offset: runStart };
+            }
+          }
+          runStart = -1;
+        }
+      }
+    }
+    const strings = Object.entries(stringMap)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 500)
+      .map(([s]) => s);
+    entry.string_count = Object.keys(stringMap).length;
+
+    // Context window helper: 60 bytes before + after a byte offset, non-printable → '.'
+    function contextWindow(offset) {
+      const start = Math.max(0, offset - 60);
+      const end   = Math.min(data.length, offset + 60);
+      let ctx = '';
+      for (let ci = start; ci < end; ci++) {
+        const b = data[ci];
+        ctx += (b >= 0x20 && b <= 0x7e) ? String.fromCharCode(b) : '.';
+      }
+      return { hex: '0x' + offset.toString(16).toUpperCase().padStart(8,'0'), ctx };
+    }
+    entry.contextWindow = contextWindow;  // expose for render
+
+    // ── Step 3: UUID harvesting (full decoded text, fresh regex) ──
+    const uuidHarvest = {}; // uuid -> { count, offset }
+    {
+      // Use the 4 MB text slice — UUIDs are short strings, this is fine
+      const UUID_H_RE = /[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}/g;
+      let um;
+      while ((um = UUID_H_RE.exec(textSlice)) !== null) {
+        const u = um[0].toLowerCase();
+        if (uuidHarvest[u]) uuidHarvest[u].count++;
+        else uuidHarvest[u] = { count: 1, offset: um.index };
+      }
+    }
+    entry.uuids = Object.keys(uuidHarvest).slice(0, 100);
+    entry.uuid_harvest = uuidHarvest;
+
+    // ── Step 4: Domain harvesting (from extracted strings) ──
+    const domainHarvest = {};
+    {
+      const DOM_RE = /[a-zA-Z0-9]([a-zA-Z0-9.\-]{1,60})\.(com|net|org|io|ai|xyz|site|app|edu|gov|biz|cc|top|icu|club)/g;
+      const allStrings = Object.keys(stringMap).join('\n');
+      let dm;
+      while ((dm = DOM_RE.exec(allStrings)) !== null) {
+        const d = dm[0].toLowerCase();
+        domainHarvest[d] = (domainHarvest[d] || 0) + 1;
+      }
+    }
+    entry.domain_harvest = domainHarvest;
+    entry.domains = Object.keys(domainHarvest).slice(0, 50);
+    // ── Hex-encoded C2 IP detection — raw byte scan (Big-Endian sockaddr_in port 443) ──
+    // The sockaddr_in struct is binary, not printable ASCII — must scan raw bytes.
+    // Pattern: 4-byte big-endian IP immediately followed by port bytes 0x01 0xbb (443)
+    // OR preceded by 0x02 0x00 0x01 0xbb (AF_INET + port 443 in network order)
+    const seenIPs = new Set();
+    // Scan raw bytes for sockaddr_in structs (port 443 = 0x01 0xbb)
+    // Cap scan at 8 MB to prevent browser hang on huge blobs
+    const scanLimit = Math.min(data.length - 6, 8 * 1024 * 1024);
+    const CHUNK = 1024 * 1024;
+    for (let bi = 0; bi <= scanLimit; bi++) {
+      if (bi > 0 && bi % CHUNK === 0) await yieldToBrowser();
+      if (data[bi+4] === 0x01 && data[bi+5] === 0xbb) {
+        const ip = `${data[bi]}.${data[bi+1]}.${data[bi+2]}.${data[bi+3]}`;
+        if (isPublicIP(ip) && !seenIPs.has(ip)) {
+          seenIPs.add(ip);
+          const note = knownC2IPs[ip] || '';
+          const conf = knownC2IPs[ip] ? 'CRITICAL' : 'HIGH';
+          entry.ioc_hits.push(`Hex-IP C2: ${ip}${note ? ' — '+note : ''}`);
+          c2IPHits.push({ fname, ip, note, confidence: conf });
+          log(`[L7] Hex-IP C2 (raw): ${ip} in ${fname}`);
+        }
+      }
+    }
+    // Also scan the printable text for any hex-encoded IP strings (belt-and-suspenders)
     let m2;
     C2_PORT_RE.lastIndex = 0;
     while ((m2 = C2_PORT_RE.exec(textLower)) !== null) {
       const ip = hexToIP(m2[1]);
-      if (isPublicIP(ip)) {
+      if (isPublicIP(ip) && !seenIPs.has(ip)) {
+        seenIPs.add(ip);
         const note = knownC2IPs[ip] || '';
         const conf = knownC2IPs[ip] ? 'CRITICAL' : 'HIGH';
-        entry.ioc_hits.push(`Hex-IP C2: ${ip}${note ? ' — '+note : ''}`);
+        entry.ioc_hits.push(`Hex-IP C2 (encoded): ${ip}${note ? ' — '+note : ''}`);
         c2IPHits.push({ fname, ip, note, confidence: conf });
-        log(`[L7] Hex-IP C2: ${ip} in ${fname}`);
+        log(`[L7] Hex-IP C2 (encoded): ${ip} in ${fname}`);
       }
     }
 
@@ -2910,7 +3230,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       let um;
       while ((um = UUID_SCAN_RE.exec(textLower)) !== null) {
         const u = um[0];
-        if (harvestedUUIDs.has(u)) {
+        if (harvestedUUIDs.has(u) && u.replace(/[0-]/g,'').length > 0) {
           entry.ioc_hits.push(`UUID cross-ref: ${u} (seen in tracev3 AND DSC binary)`);
           uuidCrossrefs.push({ fname, uuid: u });
           break; // one per blob is enough to flag it
@@ -2963,7 +3283,12 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       log(`[L7] IMPLANT: ${fname} — ${entry.macho} + ${entry.ioc_hits.length} IOC hits`);
     }
 
-    if (entry.bundles.length || entry.paths.length || entry.ioc_hits.length || entry.macho) {
+    // Always push if we extracted anything meaningful — analyst decides significance
+    const hasData = entry.bundles.length || entry.paths.length || entry.ioc_hits.length
+      || entry.macho || (entry.string_count||0) > 0
+      || Object.keys(entry.uuid_harvest||{}).length > 0
+      || Object.keys(entry.domain_harvest||{}).length > 0;
+    if (hasData) {
       ghostEntries.push(entry);
     }
   }
