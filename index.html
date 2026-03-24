@@ -2046,19 +2046,6 @@ function buildDrillDown(ind, r) {
             }
           }
 
-          // Top strings by frequency (analyst review)
-          const strMap = e.string_map || {};
-          const topStrings = Object.entries(strMap)
-            .sort((a,b) => b[1].count - a[1].count)
-            .slice(0, 20);
-          if (topStrings.length) {
-            lines.push('__HEAD__Top Strings by Frequency');
-            for (const [s, info] of topStrings) {
-              const hex = '0x' + info.offset.toString(16).toUpperCase().padStart(8,'0');
-              lines.push(`__OK__      [${String(info.count).padStart(4,' ')}×]  @${hex}  ${s.slice(0,80)}`);
-            }
-          }
-
           // UUID harvest
           const uuidH = e.uuid_harvest || {};
           const topUUIDs = Object.entries(uuidH).sort((a,b) => b[1].count - a[1].count).slice(0,10);
@@ -3199,11 +3186,6 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       .slice(0, 500)
       .map(([s]) => s);
     entry.string_count = Object.keys(stringMap).length;
-    // Keep only top 30 strings for UI drill-down (not full map — saves memory)
-    const topEntries = Object.entries(stringMap)
-      .sort((a, b) => b[1].count - a[1].count)
-      .slice(0, 30);
-    entry.string_map = Object.fromEntries(topEntries);
 
     // Context window helper: 60 bytes before + after a byte offset, non-printable → '.'
     function contextWindow(offset) {
