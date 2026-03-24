@@ -918,13 +918,13 @@ async function runAnalysis() {
     log('[INFO] Detected tar.gz archive — decompressing...');
     let rawBytes;
     try {
-      const ab = await loadedFile.arrayBuffer();
-      const u8  = new Uint8Array(ab);
+      // Read file into memory, check if gzip
+      let u8 = new Uint8Array(await loadedFile.arrayBuffer());
       const sizeMB = (u8.length/1024/1024).toFixed(0);
       log(`[INFO] File loaded (${sizeMB} MB compressed)`);
 
       if (u8[0] === 0x1f && u8[1] === 0x8b) {
-        log('[INFO] Decompressing with pako...');
+        log('[INFO] Decompressing...');
         const inflator = new pako.Inflate();
         const CHUNK = 2 * 1024 * 1024;
         for (let i = 0; i < u8.length; i += CHUNK) {
@@ -936,23 +936,26 @@ async function runAnalysis() {
           }
         }
         rawBytes = inflator.result;
+        // Release compressed buffer immediately — we only need the decompressed tar now
+        u8 = null;
+        loadedFile = null;
         log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
       } else {
         rawBytes = u8;
+        u8 = null;
       }
     } catch(e) {
       log(`[ERROR] Decompression failed: ${e}`);
       log('[HINT] This archive may be too large for browser memory. Try:');
       log('  1. Close ALL other browser tabs');
-      log('  2. Use Chrome or Edge (not Safari)');
-      log('  3. Decompress locally: tar -xzf file.tar.gz');
+      log('  2. Decompress locally: tar -xzf file.tar.gz');
       log('     Then drag the extracted folder or individual .tracev3 files');
       document.getElementById('run-btn').disabled = false;
       document.getElementById('run-btn').textContent = '▶  ANALYZE';
       return;
     }
 
-    log('[INFO] Parsing tar...');
+    log('[INFO] Extracting relevant files...');
     let tarEntries;
     try {
       tarEntries = parseTar(rawBytes);
@@ -963,7 +966,7 @@ async function runAnalysis() {
       return;
     }
 
-    // Release the raw decompressed buffer — parseTar already sliced what it needs
+    // Release the decompressed buffer — parseTar already sliced what it needs
     rawBytes = null;
 
     const entryNames = Object.keys(tarEntries);
