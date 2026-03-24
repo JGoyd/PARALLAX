@@ -964,7 +964,7 @@ async function runAnalysis() {
     log('[INFO] Extracting relevant files...');
     let tarEntries;
     try {
-      tarEntries = parseTar(rawBytes);
+      tarEntries = await parseTar(rawBytes);
     } catch(e) {
       log(`[ERROR] Tar parse failed: ${e}`);
       document.getElementById('run-btn').disabled = false;
