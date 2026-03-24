@@ -870,8 +870,6 @@ async function runAnalysis() {
     while (end < start + len && u8[end] !== 0) end++;
     return new TextDecoder('ascii', {fatal:false}).decode(u8.slice(start, end));
   }
-
-  // Check if a tar entry is one we need to keep in memory
   const WANTED_TEXT_FILES = new Set([
     'pmudiagnose.txt', 'ps.txt', 'jetsam_priority.csv',
     'taskSummary.csv', 'mount.txt'
@@ -882,6 +880,28 @@ async function runAnalysis() {
     if (WANTED_TEXT_FILES.has(base)) return true;
     if (fullName.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) return true;
     return false;
+  }
+  // Selective tar parser — only slices wanted files, skips everything else
+  function parseTar(buffer) {
+    const files = {};
+    const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let offset = 0;
+    while (offset + 512 <= u8.length) {
+      const header = u8.subarray(offset, offset + 512);
+      if (header.every(b => b === 0)) break;
+      const name    = readStr(header, 0,   100);
+      const prefix  = readStr(header, 345, 155);
+      const sizeOct = readStr(header, 124,  12);
+      const type    = String.fromCharCode(header[156]);
+      const fullName = (prefix ? prefix + '/' : '') + name;
+      const size    = parseInt(sizeOct.trim() || '0', 8) || 0;
+      offset += 512;
+      if ((type === '0' || type === '' || type === '\0') && size > 0 && isWantedEntry(fullName)) {
+        files[fullName] = u8.slice(offset, offset + size);
+      }
+      offset += Math.ceil(size / 512) * 512;
+    }
+    return files;
   }
 
   // ── Extract archive (tar.gz or zip) ──────────────────────────────────────
@@ -895,217 +915,109 @@ async function runAnalysis() {
                   || fname.endsWith('.tar') || fname.endsWith('.gz');
 
   if (isTarGz) {
-    log('[INFO] Detected tar.gz archive...');
+    log('[INFO] Detected tar.gz archive — decompressing...');
+    let rawBytes;
     try {
       const ab = await loadedFile.arrayBuffer();
-      const u8 = new Uint8Array(ab);
+      const u8  = new Uint8Array(ab);
       const sizeMB = (u8.length/1024/1024).toFixed(0);
       log(`[INFO] File loaded (${sizeMB} MB compressed)`);
 
-      const isGzip = u8[0] === 0x1f && u8[1] === 0x8b;
-      let tarBytes = null;
-
-      // ── Streaming tar parser state ──────────────────────────────────────
-      // Parses tar entries incrementally from a rolling buffer fed by the
-      // decompressor. Only wanted files are allocated — everything else is
-      // skipped by advancing the offset. Peak memory ≈ compressed file +
-      // rolling buffer (~10MB) + kept files only.
-      let _buf = new Uint8Array(0);
-      let _bOff = 0;
-      let _skipBytes = 0;
-      let _wantEntry = null; // { name, size, padded, collected: [chunks] }
-      let totalEntries = 0, keptEntries = 0;
-      const decoder = new TextDecoder('utf-8', {fatal: false});
-
-      function _compact() {
-        if (_bOff > 4*1024*1024) {
-          _buf = _buf.slice(_bOff);
-          _bOff = 0;
-        }
-      }
-
-      function _feed(chunk) {
-        // Compact first: discard already-consumed bytes
-        if (_bOff > 0) { _buf = _buf.slice(_bOff); _bOff = 0; }
-        // Only merge when buffer already has data; otherwise just adopt the chunk
-        if (_buf.length === 0) {
-          _buf = chunk.slice(); // own copy
-        } else {
-          const merged = new Uint8Array(_buf.length + chunk.length);
-          merged.set(_buf);
-          merged.set(chunk, _buf.length);
-          _buf = merged;
-        }
-      }
-
-      function _drain() {
-        while (true) {
-          const avail = _buf.length - _bOff;
-
-          // Collecting data for a wanted entry
-          if (_wantEntry) {
-            const need = _wantEntry.padded - _wantEntry.got;
-            if (avail < need) break;
-            const raw = _buf.slice(_bOff, _bOff + _wantEntry.size - _wantEntry.dataGot);
-            _bOff += need;
-            // Store the file
-            const base = _wantEntry.name.split('/').pop();
-            if (base.endsWith('.tracev3')) {
-              tracev3Files[base] = decoder.decode(raw);
-            } else if (base === 'pmudiagnose.txt') {
-              pmuText = decoder.decode(raw);
-            } else if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
-              extraTextFiles[base] = decoder.decode(raw);
-            } else if (_wantEntry.name.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
-              dscBlobs[base] = raw;
-            }
-            keptEntries++;
-            _wantEntry = null;
-            continue;
-          }
-
-          // Skipping unwanted data
-          if (_skipBytes > 0) {
-            const skip = Math.min(_skipBytes, avail);
-            _bOff += skip;
-            _skipBytes -= skip;
-            if (_skipBytes > 0) break;
-            continue;
-          }
-
-          // Read next 512-byte tar header
-          if (avail < 512) break;
-          const header = _buf.subarray(_bOff, _bOff + 512);
-          if (header.every(b => b === 0)) {
-            _bOff += 512;
-            // Tar ends with TWO consecutive zero blocks; a single one may be padding
-            if (avail >= 1024) {
-              const next = _buf.subarray(_bOff, _bOff + 512);
-              if (next.every(b => b === 0)) { _bOff += 512; break; } // true end
-            }
-            continue; // skip lone zero block, keep parsing
-          }
-
-          const name    = readStr(header, 0, 100);
-          const prefix  = readStr(header, 345, 155);
-          const sizeOct = readStr(header, 124, 12);
-          const type    = String.fromCharCode(header[156]);
-          const fullName = (prefix ? prefix + '/' : '') + name;
-          const size    = parseInt(sizeOct.trim() || '0', 8) || 0;
-          const padded  = Math.ceil(size / 512) * 512;
-          _bOff += 512;
-          totalEntries++;
-
-          if ((type === '0' || type === '' || type === '\0') && size > 0) {
-            if (isWantedEntry(fullName)) {
-              // Can we read it now?
-              if (_buf.length - _bOff >= padded) {
-                const raw = _buf.slice(_bOff, _bOff + size);
-                _bOff += padded;
-                const base = fullName.split('/').pop();
-                if (base.endsWith('.tracev3')) {
-                  tracev3Files[base] = decoder.decode(raw);
-                } else if (base === 'pmudiagnose.txt') {
-                  pmuText = decoder.decode(raw);
-                } else if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
-                  extraTextFiles[base] = decoder.decode(raw);
-                } else if (fullName.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
-                  dscBlobs[base] = raw;
-                }
-                keptEntries++;
-              } else {
-                // Need more data — set up collection
-                _wantEntry = { name: fullName, size, padded, got: 0, dataGot: 0 };
-                // We'll collect on next _drain call when buffer has enough
-                break;
+      if (u8[0] === 0x1f && u8[1] === 0x8b) {
+        // Try native DecompressionStream first (better memory handling)
+        if (typeof DecompressionStream !== 'undefined') {
+          log('[INFO] Using native browser decompression...');
+          try {
+            const ds = new DecompressionStream('gzip');
+            const blob = new Blob([u8]);
+            const stream = blob.stream().pipeThrough(ds);
+            const reader = stream.getReader();
+            const chunks = [];
+            let totalSize = 0;
+            while (true) {
+              const {done, value} = await reader.read();
+              if (done) break;
+              chunks.push(value);
+              totalSize += value.length;
+              if (totalSize % (50*1024*1024) < value.length) {
+                log(`[INFO] Decompressing... ${(totalSize/1024/1024).toFixed(0)} MB`);
               }
-            } else {
-              // Skip
-              const canSkip = Math.min(padded, _buf.length - _bOff);
-              _bOff += canSkip;
-              _skipBytes = padded - canSkip;
             }
-          } else {
-            const canSkip = Math.min(padded, _buf.length - _bOff);
-            _bOff += canSkip;
-            _skipBytes = padded - canSkip;
+            rawBytes = new Uint8Array(totalSize);
+            let off = 0;
+            for (const c of chunks) { rawBytes.set(c, off); off += c.length; }
+            chunks.length = 0; // free chunk references
+            log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
+          } catch(nativeErr) {
+            log('[WARN] Native decompression failed, falling back to pako...');
+            rawBytes = null;
           }
         }
-        _compact();
-      }
 
-      if (isGzip && typeof DecompressionStream !== 'undefined') {
-        // ── True streaming: decompress → parse → extract in one pass ─────
-        log('[INFO] Streaming decompress + extract (low memory)...');
-        const ds = new DecompressionStream('gzip');
-        const blob = new Blob([u8]);
-        const stream = blob.stream().pipeThrough(ds);
-        const reader = stream.getReader();
-        let totalDecompressed = 0;
-        while (true) {
-          const {done, value} = await reader.read();
-          if (done) break;
-          totalDecompressed += value.length;
-          _feed(value);
-          _drain();
-          if (totalDecompressed % (10*1024*1024) < (value.length + 1)) {
-            await new Promise(r => setTimeout(r, 0)); // yield to browser
+        // Fallback to pako streaming inflate
+        if (!rawBytes) {
+          log('[INFO] Using pako streaming inflate...');
+          const inflator = new pako.Inflate();
+          const CHUNK = 2 * 1024 * 1024;
+          for (let i = 0; i < u8.length; i += CHUNK) {
+            const end = Math.min(i + CHUNK, u8.length);
+            inflator.push(u8.subarray(i, end), end === u8.length);
+            if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
+            if (i % (20*1024*1024) === 0 && i > 0) {
+              log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} MB processed`);
+            }
           }
-          if (totalDecompressed % (50*1024*1024) < (value.length + 1)) {
-            log(`[INFO] Streaming... ${(totalDecompressed/1024/1024).toFixed(0)} MB, ${keptEntries} files kept`);
-          }
+          rawBytes = inflator.result;
+          log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
         }
-        _drain();
-        log(`[INFO] Streamed ${(totalDecompressed/1024/1024).toFixed(0)} MB total`);
-
-      } else if (isGzip) {
-        // ── Pako fallback — inflate then stream-parse ─────────────────────
-        log('[INFO] Decompressing via pako...');
-        const inflator = new pako.Inflate();
-        const CHUNK = 2 * 1024 * 1024;
-        for (let i = 0; i < u8.length; i += CHUNK) {
-          const end = Math.min(i + CHUNK, u8.length);
-          inflator.push(u8.subarray(i, end), end === u8.length);
-          if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
-          if (i % (20*1024*1024) === 0 && i > 0) {
-            log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} MB`);
-          }
-        }
-        const raw = inflator.result;
-        log(`[INFO] Decompressed (${(raw.length/1024/1024).toFixed(0)} MB) — extracting...`);
-        // Feed in chunks to the streaming parser
-        const FEED = 8 * 1024 * 1024;
-        for (let i = 0; i < raw.length; i += FEED) {
-          _feed(raw.subarray(i, Math.min(i + FEED, raw.length)));
-          _drain();
-        }
-        _drain();
-
       } else {
-        // Plain .tar
-        log('[INFO] Parsing tar...');
-        const FEED = 8 * 1024 * 1024;
-        for (let i = 0; i < u8.length; i += FEED) {
-          _feed(u8.subarray(i, Math.min(i + FEED, u8.length)));
-          _drain();
-        }
-        _drain();
+        rawBytes = u8;
       }
-
-      // Release rolling buffer
-      _buf = null;
-      log(`[INFO] ${totalEntries} tar entries scanned, ${keptEntries} relevant files kept`);
-
     } catch(e) {
-      log(`[ERROR] Extraction failed: ${e}`);
-      log('[HINT] If this fails on mobile, try:');
-      log('  1. Close all other browser tabs');
-      log('  2. Decompress locally: tar -xzf file.tar.gz');
-      log('     Then drag individual .tracev3 files');
+      log(`[ERROR] Decompression failed: ${e}`);
+      log('[HINT] This archive may be too large for browser memory. Try:');
+      log('  1. Close ALL other browser tabs');
+      log('  2. Use Chrome or Edge (not Safari)');
+      log('  3. Decompress locally: tar -xzf file.tar.gz');
+      log('     Then drag the extracted folder or individual .tracev3 files');
       document.getElementById('run-btn').disabled = false;
       document.getElementById('run-btn').textContent = '▶  ANALYZE';
       return;
     }
+
+    log('[INFO] Parsing tar...');
+    let tarEntries;
+    try {
+      tarEntries = parseTar(rawBytes);
+    } catch(e) {
+      log(`[ERROR] Tar parse failed: ${e}`);
+      document.getElementById('run-btn').disabled = false;
+      document.getElementById('run-btn').textContent = '▶  ANALYZE';
+      return;
+    }
+
+    // Release the raw decompressed buffer — parseTar already sliced what it needs
+    rawBytes = null;
+
+    const entryNames = Object.keys(tarEntries);
+    log(`[INFO] tar contains ${entryNames.length} entries`);
+    const decoder = new TextDecoder('utf-8', {fatal: false});
+
+    for (const name of entryNames) {
+      const base = name.split('/').pop();
+      const data = tarEntries[name];
+      if (base.endsWith('.tracev3')) {
+        tracev3Files[base] = decoder.decode(data);
+      } else if (base === 'pmudiagnose.txt') {
+        pmuText = decoder.decode(data);
+      } else if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
+        extraTextFiles[base] = decoder.decode(data);
+      } else if (name.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
+        dscBlobs[base] = data;
+      }
+    }
+    // Release parsed tar entries — we've extracted what we need
+    tarEntries = null;
 
   } else {
     // ── ZIP path ────────────────────────────────────────────────────────────
@@ -1335,90 +1247,43 @@ async function runAnalysis() {
     l3bStatus, 0, l3bParts.join(' · ') || 'ciphermld not detected');
   log(`[L3b] ${l3bStatus}`);
 
-  // ── L4 Process / System Corroboration (ps.txt, jetsam, mount) ──────────
+  // ── L4 Process / System Corroboration ──────────────────────────────────
   log('[L4] Process and system state...');
   const l4parts = [];
   let l4status = 'NOT_DETECTED';
-
-  // ps.txt — running processes at capture time
   const psText = extraTextFiles['ps.txt'] || '';
   if (psText) {
     const psLines = psText.split('\n');
-    // Check for networkserviceproxy
     const nspLine = psLines.find(l => l.includes('networkserviceproxy'));
     if (nspLine) {
       const pidMatch = nspLine.match(/\s+(\d+)\s+/);
-      const nspPid = pidMatch ? pidMatch[1] : '?';
-      l4parts.push(`networkserviceproxy running (PID ${nspPid})`);
+      l4parts.push(`networkserviceproxy running (PID ${pidMatch ? pidMatch[1] : '?'})`);
     }
-    // Check for NSProxy / FEEDEEEE-related bundle IDs
-    const nsproxy = psLines.find(l => /nsproxy|NSProxy/i.test(l) && !l.includes('networkserviceproxy'));
-    if (nsproxy) {
-      l4parts.push(`NSProxy PacketTunnel process detected in ps.txt`);
+    if (psLines.some(l => /nsproxy|NSProxy/i.test(l) && !l.includes('networkserviceproxy'))) {
+      l4parts.push('NSProxy PacketTunnel process detected');
       l4status = 'CONFIRMED';
     }
-    // Check for ciphermld running
     if (psLines.some(l => l.includes('ciphermld'))) {
-      l4parts.push(`ciphermld active at capture time`);
+      l4parts.push('ciphermld active at capture');
       l4status = 'CONFIRMED';
     }
-    // Count total processes
-    const procCount = psLines.filter(l => l.trim() && !l.startsWith('USER')).length;
-    l4parts.push(`${procCount} processes at capture`);
-  } else {
-    l4parts.push('ps.txt not found');
-  }
-
-  // jetsam_priority.csv — process memory and priority tiers
+  } else { l4parts.push('ps.txt not found'); }
   const jetsamText = extraTextFiles['jetsam_priority.csv'] || '';
   if (jetsamText) {
-    const jetLines = jetsamText.split('\n');
-    const nspJet = jetLines.find(l => l.includes('networkserviceproxy'));
+    const nspJet = jetsamText.split('\n').find(l => l.includes('networkserviceproxy'));
     if (nspJet) {
       const cols = nspJet.split(',');
-      const priority = cols[0] ? cols[0].trim() : '?';
-      const memPages = cols[4] ? cols[4].trim() : '?';
-      const memKB = memPages !== '?' ? Math.round(parseInt(memPages) * 16 / 1024) : '?';
-      l4parts.push(`NSP jetsam priority ${priority}, ~${memKB}KB memory`);
+      l4parts.push(`NSP jetsam priority ${(cols[0]||'?').trim()}`);
     }
-    // Check for NSProxy or FEEDEEEE bundle in jetsam
-    const suspiciousJet = jetLines.filter(l =>
-      /nsproxy|NSProxy|FEEDEEEE/i.test(l) && !l.includes('networkserviceproxy')
-    );
-    if (suspiciousJet.length) {
-      l4parts.push(`${suspiciousJet.length} suspicious process(es) in jetsam: ${suspiciousJet.map(l => { const c = l.split(','); return c[c.length-2] || 'unknown'; }).join(', ')}`);
-      l4status = 'CONFIRMED';
-    }
+    const suspJet = jetsamText.split('\n').filter(l => /nsproxy|NSProxy|FEEDEEEE/i.test(l) && !l.includes('networkserviceproxy'));
+    if (suspJet.length) { l4parts.push(`${suspJet.length} suspicious process(es) in jetsam`); l4status = 'CONFIRMED'; }
   }
-
-  // mount.txt — check for unexpected mount points
-  const mountText = extraTextFiles['mount.txt'] || '';
-  if (mountText) {
-    const mountLines = mountText.split('\n').filter(l => l.trim());
-    const unexpected = mountLines.filter(l =>
-      !l.includes('/dev/disk') || l.includes('/usr/local') || l.includes('/private/var/tmp')
-    );
-    // Standard mounts are /, /private/var, /private/var/wireless, /private/var/MobileSoftwareUpdate
-    const suspiciousMounts = mountLines.filter(l =>
-      l.includes('/usr/local') || l.includes('noexec') === false && l.includes('union')
-    );
-    if (suspiciousMounts.length) {
-      l4parts.push(`unusual mount: ${suspiciousMounts.map(l => l.split(' on ')[1]?.split(' ')[0] || l.slice(0,60)).join(', ')}`);
-      if (l4status === 'NOT_DETECTED') l4status = 'POSSIBLE';
-    }
-    l4parts.push(`${mountLines.length} mount points`);
+  if (l4status === 'NOT_DETECTED' && psText.includes('networkserviceproxy') && l3bStatus === 'CONFIRMED') {
+    l4status = 'POSSIBLE';
   }
-
-  // Elevate L4 status if NSP is running + prior layers confirmed
-  if (l4status === 'NOT_DETECTED' && psText && psText.includes('networkserviceproxy')) {
-    if (l3bStatus === 'CONFIRMED') l4status = 'POSSIBLE';
-  }
-
   addIndicator(result, 'L4', 'Process / System Corroboration',
     l4status, 0, l4parts.join(' · ') || 'System state files not available');
   log(`[L4] ${l4status}`);
-  result.ps_text = psText;
-  result.jetsam_text = jetsamText;
 
   // ── L5 Egress ──
   log('[L5] Active egress / relay nodes...');
@@ -1991,17 +1856,7 @@ function buildDrillDown(ind, r) {
     case 'L4':
       if (ind.status !== 'NOT_DETECTED') {
         lines.push('__HEAD__Process & System State at Capture');
-        if (r.ps_text && r.ps_text.includes('networkserviceproxy')) {
-          const nspLine = r.ps_text.split('\n').find(l => l.includes('networkserviceproxy')) || '';
-          lines.push(`__WARN__  networkserviceproxy active at capture time`);
-          if (nspLine.trim()) lines.push(`  ${nspLine.trim().slice(0, 120)}`);
-        }
-        if (r.jetsam_text) {
-          const nspJet = r.jetsam_text.split('\n').find(l => l.includes('networkserviceproxy'));
-          if (nspJet) lines.push(`  jetsam: ${nspJet.trim().slice(0, 120)}`);
-        }
-        lines.push('__PLAIN_HEAD__What this means for you');
-        lines.push('__PLAIN__At the exact moment this diagnostic was captured, the relay process was actively running on your device. It was not triggered by a phone call or anything you did — it runs continuously in the background as part of the operating system.');
+        lines.push('__PLAIN__At the moment this diagnostic was captured, surveillance-related processes were confirmed running on the device with no user interaction.');
       }
       break;
     case 'L5':
@@ -2867,12 +2722,6 @@ function renderDeviceMap(el, r) {
     { layer:'L3b', icon:'🚰', title:'Hidden outbound pipe',
       sub:'ciphermld · runs inside Apple services' },
     status('L3b')
-  ));
-
-  colCenter.appendChild(makeMapBlock(
-    { layer:'L4', icon:'🔬', title:'Process confirmation',
-      sub:'ps · jetsam · system state at capture' },
-    status('L4')
   ));
 
   // Arrow
