@@ -925,11 +925,17 @@ async function runAnalysis() {
       }
 
       function _feed(chunk) {
+        // Compact first: discard already-consumed bytes
         if (_bOff > 0) { _buf = _buf.slice(_bOff); _bOff = 0; }
-        const merged = new Uint8Array(_buf.length + chunk.length);
-        merged.set(_buf);
-        merged.set(chunk, _buf.length);
-        _buf = merged;
+        // Only merge when buffer already has data; otherwise just adopt the chunk
+        if (_buf.length === 0) {
+          _buf = chunk.slice(); // own copy
+        } else {
+          const merged = new Uint8Array(_buf.length + chunk.length);
+          merged.set(_buf);
+          merged.set(chunk, _buf.length);
+          _buf = merged;
+        }
       }
 
       function _drain() {
@@ -970,7 +976,15 @@ async function runAnalysis() {
           // Read next 512-byte tar header
           if (avail < 512) break;
           const header = _buf.subarray(_bOff, _bOff + 512);
-          if (header.every(b => b === 0)) { _bOff += 512; break; }
+          if (header.every(b => b === 0)) {
+            _bOff += 512;
+            // Tar ends with TWO consecutive zero blocks; a single one may be padding
+            if (avail >= 1024) {
+              const next = _buf.subarray(_bOff, _bOff + 512);
+              if (next.every(b => b === 0)) { _bOff += 512; break; } // true end
+            }
+            continue; // skip lone zero block, keep parsing
+          }
 
           const name    = readStr(header, 0, 100);
           const prefix  = readStr(header, 345, 155);
@@ -1034,6 +1048,9 @@ async function runAnalysis() {
           totalDecompressed += value.length;
           _feed(value);
           _drain();
+          if (totalDecompressed % (10*1024*1024) < (value.length + 1)) {
+            await new Promise(r => setTimeout(r, 0)); // yield to browser
+          }
           if (totalDecompressed % (50*1024*1024) < (value.length + 1)) {
             log(`[INFO] Streaming... ${(totalDecompressed/1024/1024).toFixed(0)} MB, ${keptEntries} files kept`);
           }
