@@ -902,7 +902,7 @@ async function runAnalysis() {
         files[fullName] = u8.slice(offset, offset + size);
       }
       offset += Math.ceil(size / 512) * 512;
-      if (entries % 200 === 0) {
+      if (entries % 50 === 0) {
         await new Promise(r => setTimeout(r, 0));
       }
     }
@@ -931,12 +931,12 @@ async function runAnalysis() {
       if (u8[0] === 0x1f && u8[1] === 0x8b) {
         log('[INFO] Decompressing...');
         const inflator = new pako.Inflate();
-        const CHUNK = 2 * 1024 * 1024;
+        const CHUNK = 512 * 1024;
         for (let i = 0; i < u8.length; i += CHUNK) {
           const end = Math.min(i + CHUNK, u8.length);
           inflator.push(u8.subarray(i, end), end === u8.length);
           if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
-          if (i % (10*1024*1024) === 0 && i > 0) {
+          if (i % (5*1024*1024) === 0) {
             log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} / ${sizeMB} MB`);
             await new Promise(r => setTimeout(r, 0));
           }
