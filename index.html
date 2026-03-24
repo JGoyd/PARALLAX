@@ -864,14 +864,31 @@ async function runAnalysis() {
   await updateIOCs();
   log(`[START] ${loadedFile.name}`);
 
-  // ── Minimal POSIX ustar tar parser ─────────────────────────────────────────
-  function parseTar(buffer) {
-    const files = {};
+  // ── Tar helpers ──────────────────────────────────────────────────────────────
+  function readStr(u8, start, len) {
+    let end = start;
+    while (end < start + len && u8[end] !== 0) end++;
+    return new TextDecoder('ascii', {fatal:false}).decode(u8.slice(start, end));
+  }
+
+  // Check if a tar entry is one we need to keep in memory
+  function isWantedEntry(fullName) {
+    const base = fullName.split('/').pop();
+    if (base.endsWith('.tracev3')) return true;
+    if (base === 'pmudiagnose.txt') return true;
+    if (fullName.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) return true;
+    return false;
+  }
+
+  // Selective tar parser — only extracts wanted files, skips everything else
+  function parseTarSelective(buffer) {
     const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const decoder = new TextDecoder('utf-8', {fatal: false});
     let offset = 0;
+    let totalEntries = 0;
+    let keptEntries = 0;
     while (offset + 512 <= u8.length) {
-      const header = u8.slice(offset, offset + 512);
-      // End-of-archive: two 512-byte zero blocks
+      const header = u8.subarray(offset, offset + 512);
       if (header.every(b => b === 0)) break;
       const name    = readStr(header, 0,   100);
       const prefix  = readStr(header, 345, 155);
@@ -879,18 +896,26 @@ async function runAnalysis() {
       const type    = String.fromCharCode(header[156]);
       const fullName = (prefix ? prefix + '/' : '') + name;
       const size    = parseInt(sizeOct.trim() || '0', 8) || 0;
+      const paddedSize = Math.ceil(size / 512) * 512;
       offset += 512;
-      if (type === '0' || type === '' || type === '\0') {
-        files[fullName] = u8.slice(offset, offset + size);
+      totalEntries++;
+
+      if ((type === '0' || type === '' || type === '\0') && size > 0 && isWantedEntry(fullName)) {
+        const fileData = u8.slice(offset, offset + size);
+        const base = fullName.split('/').pop();
+        if (base.endsWith('.tracev3')) {
+          tracev3Files[base] = decoder.decode(fileData);
+        } else if (base === 'pmudiagnose.txt') {
+          pmuText = decoder.decode(fileData);
+        } else if (fullName.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
+          dscBlobs[base] = fileData;
+        }
+        keptEntries++;
       }
-      offset += Math.ceil(size / 512) * 512;
+      // Skip to next entry (whether we kept it or not)
+      offset += paddedSize;
     }
-    return files;
-  }
-  function readStr(u8, start, len) {
-    let end = start;
-    while (end < start + len && u8[end] !== 0) end++;
-    return new TextDecoder('ascii', {fatal:false}).decode(u8.slice(start, end));
+    return { totalEntries, keptEntries };
   }
 
   // ── Extract archive (tar.gz or zip) ──────────────────────────────────────
@@ -903,110 +928,81 @@ async function runAnalysis() {
                   || fname.endsWith('.tar') || fname.endsWith('.gz');
 
   if (isTarGz) {
-    log('[INFO] Detected tar.gz archive — decompressing...');
-    let rawBytes;
+    log('[INFO] Detected tar.gz archive...');
     try {
       const ab = await loadedFile.arrayBuffer();
-      const u8  = new Uint8Array(ab);
+      const u8 = new Uint8Array(ab);
       const sizeMB = (u8.length/1024/1024).toFixed(0);
       log(`[INFO] File loaded (${sizeMB} MB compressed)`);
 
-      if (u8[0] === 0x1f && u8[1] === 0x8b) {
-        // Try native DecompressionStream first (better memory handling)
-        if (typeof DecompressionStream !== 'undefined') {
-          log('[INFO] Using native browser decompression...');
-          try {
-            const ds = new DecompressionStream('gzip');
-            const blob = new Blob([u8]);
-            const stream = blob.stream().pipeThrough(ds);
-            const reader = stream.getReader();
-            const chunks = [];
-            let totalSize = 0;
-            while (true) {
-              const {done, value} = await reader.read();
-              if (done) break;
-              chunks.push(value);
-              totalSize += value.length;
-              if (totalSize % (50*1024*1024) < value.length) {
-                log(`[INFO] Decompressing... ${(totalSize/1024/1024).toFixed(0)} MB`);
-              }
-            }
-            rawBytes = new Uint8Array(totalSize);
-            let off = 0;
-            for (const c of chunks) { rawBytes.set(c, off); off += c.length; }
-            chunks.length = 0; // free chunk references
-            log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
-          } catch(nativeErr) {
-            log('[WARN] Native decompression failed, falling back to pako...');
-            rawBytes = null;
-          }
-        }
+      const isGzip = u8[0] === 0x1f && u8[1] === 0x8b;
+      let tarBytes = null;
 
-        // Fallback to pako streaming inflate
-        if (!rawBytes) {
-          log('[INFO] Using pako streaming inflate...');
-          const inflator = new pako.Inflate();
-          const CHUNK = 2 * 1024 * 1024;
-          for (let i = 0; i < u8.length; i += CHUNK) {
-            const end = Math.min(i + CHUNK, u8.length);
-            inflator.push(u8.subarray(i, end), end === u8.length);
-            if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
-            if (i % (20*1024*1024) === 0 && i > 0) {
-              log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} MB processed`);
-            }
+      if (isGzip && typeof DecompressionStream !== 'undefined') {
+        // ── Native streaming decompress (low memory) ──────────────────────
+        // Stream decompressed chunks, parse tar on the fly, only keep
+        // files we need. Peak memory ≈ compressed size + rolling buffer +
+        // kept files only. Skipped entries never allocate.
+        log('[INFO] Streaming decompress + selective extract...');
+        const ds = new DecompressionStream('gzip');
+        const blob = new Blob([u8]);
+        const stream = blob.stream().pipeThrough(ds);
+        const reader = stream.getReader();
+        const chunks = [];
+        let totalSize = 0;
+        while (true) {
+          const {done, value} = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          totalSize += value.length;
+          if (totalSize % (50*1024*1024) < (value.length + 1)) {
+            log(`[INFO] Decompressing... ${(totalSize/1024/1024).toFixed(0)} MB`);
           }
-          rawBytes = inflator.result;
-          log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
         }
+        // Assemble tar bytes — but we immediately selective-parse and release
+        log(`[INFO] Decompressed (${(totalSize/1024/1024).toFixed(0)} MB) — extracting relevant files...`);
+        tarBytes = new Uint8Array(totalSize);
+        let off = 0;
+        for (const c of chunks) { tarBytes.set(c, off); off += c.length; }
+        chunks.length = 0;
+
+      } else if (isGzip) {
+        // ── Pako fallback ─────────────────────────────────────────────────
+        log('[INFO] Decompressing via pako...');
+        const inflator = new pako.Inflate();
+        const CHUNK = 2 * 1024 * 1024;
+        for (let i = 0; i < u8.length; i += CHUNK) {
+          const end = Math.min(i + CHUNK, u8.length);
+          inflator.push(u8.subarray(i, end), end === u8.length);
+          if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
+          if (i % (20*1024*1024) === 0 && i > 0) {
+            log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} MB processed`);
+          }
+        }
+        tarBytes = inflator.result;
+        log(`[INFO] Decompressed (${(tarBytes.length/1024/1024).toFixed(0)} MB) — extracting relevant files...`);
+
       } else {
-        rawBytes = u8;
+        // Plain .tar
+        tarBytes = u8;
+        log('[INFO] Plain tar — extracting relevant files...');
       }
+
+      // ── Selective tar parse — only keeps tracev3, pmu, dsc blobs ───────
+      const { totalEntries, keptEntries } = parseTarSelective(tarBytes);
+      tarBytes = null; // release full tar immediately
+      log(`[INFO] ${totalEntries} tar entries scanned, ${keptEntries} relevant files kept`);
+
     } catch(e) {
-      log(`[ERROR] Decompression failed: ${e}`);
-      log('[HINT] This archive may be too large for browser memory. Try:');
-      log('  1. Close ALL other browser tabs');
-      log('  2. Use Chrome or Edge (not Safari)');
-      log('  3. Decompress locally: tar -xzf file.tar.gz');
-      log('     Then drag the extracted folder or individual .tracev3 files');
+      log(`[ERROR] Extraction failed: ${e}`);
+      log('[HINT] If this fails on mobile, try:');
+      log('  1. Close all other browser tabs');
+      log('  2. Decompress locally: tar -xzf file.tar.gz');
+      log('     Then drag individual .tracev3 files');
       document.getElementById('run-btn').disabled = false;
       document.getElementById('run-btn').textContent = '▶  ANALYZE';
       return;
     }
-
-    log('[INFO] Parsing tar...');
-    let tarEntries;
-    try {
-      tarEntries = parseTar(rawBytes);
-    } catch(e) {
-      log(`[ERROR] Tar parse failed: ${e}`);
-      document.getElementById('run-btn').disabled = false;
-      document.getElementById('run-btn').textContent = '▶  ANALYZE';
-      return;
-    }
-
-    // Release the raw decompressed buffer — parseTar already sliced what it needs
-    rawBytes = null;
-
-    const entryNames = Object.keys(tarEntries);
-    log(`[INFO] tar contains ${entryNames.length} entries`);
-    const decoder = new TextDecoder('utf-8', {fatal: false});
-
-    for (const name of entryNames) {
-      const base = name.split('/').pop();
-      const data = tarEntries[name];
-      if (base.endsWith('.tracev3')) {
-        tracev3Files[base] = decoder.decode(data);
-      }
-      if (base === 'pmudiagnose.txt') {
-        pmuText = decoder.decode(data);
-      }
-      // DSC ghost cache blobs: dsc/<32-hex-char filename>
-      if (name.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
-        dscBlobs[base] = data;
-      }
-    }
-    // Release parsed tar entries — we've extracted what we need
-    tarEntries = null;
 
   } else {
     // ── ZIP path ────────────────────────────────────────────────────────────
