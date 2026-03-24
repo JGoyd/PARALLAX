@@ -924,52 +924,19 @@ async function runAnalysis() {
       log(`[INFO] File loaded (${sizeMB} MB compressed)`);
 
       if (u8[0] === 0x1f && u8[1] === 0x8b) {
-        // Try native DecompressionStream first (better memory handling)
-        if (typeof DecompressionStream !== 'undefined') {
-          log('[INFO] Using native browser decompression...');
-          try {
-            const ds = new DecompressionStream('gzip');
-            const blob = new Blob([u8]);
-            const stream = blob.stream().pipeThrough(ds);
-            const reader = stream.getReader();
-            const chunks = [];
-            let totalSize = 0;
-            while (true) {
-              const {done, value} = await reader.read();
-              if (done) break;
-              chunks.push(value);
-              totalSize += value.length;
-              if (totalSize % (50*1024*1024) < value.length) {
-                log(`[INFO] Decompressing... ${(totalSize/1024/1024).toFixed(0)} MB`);
-              }
-            }
-            rawBytes = new Uint8Array(totalSize);
-            let off = 0;
-            for (const c of chunks) { rawBytes.set(c, off); off += c.length; }
-            chunks.length = 0; // free chunk references
-            log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
-          } catch(nativeErr) {
-            log('[WARN] Native decompression failed, falling back to pako...');
-            rawBytes = null;
+        log('[INFO] Decompressing with pako...');
+        const inflator = new pako.Inflate();
+        const CHUNK = 2 * 1024 * 1024;
+        for (let i = 0; i < u8.length; i += CHUNK) {
+          const end = Math.min(i + CHUNK, u8.length);
+          inflator.push(u8.subarray(i, end), end === u8.length);
+          if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
+          if (i % (20*1024*1024) === 0 && i > 0) {
+            log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} / ${sizeMB} MB`);
           }
         }
-
-        // Fallback to pako streaming inflate
-        if (!rawBytes) {
-          log('[INFO] Using pako streaming inflate...');
-          const inflator = new pako.Inflate();
-          const CHUNK = 2 * 1024 * 1024;
-          for (let i = 0; i < u8.length; i += CHUNK) {
-            const end = Math.min(i + CHUNK, u8.length);
-            inflator.push(u8.subarray(i, end), end === u8.length);
-            if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
-            if (i % (20*1024*1024) === 0 && i > 0) {
-              log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} MB processed`);
-            }
-          }
-          rawBytes = inflator.result;
-          log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
-        }
+        rawBytes = inflator.result;
+        log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
       } else {
         rawBytes = u8;
       }
