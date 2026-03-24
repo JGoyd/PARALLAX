@@ -882,11 +882,10 @@ async function runAnalysis() {
     return false;
   }
   // Selective tar parser — only slices wanted files, skips everything else
-  async function parseTar(buffer) {
+  function parseTar(buffer) {
     const files = {};
     const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     let offset = 0;
-    let entries = 0;
     while (offset + 512 <= u8.length) {
       const header = u8.subarray(offset, offset + 512);
       if (header.every(b => b === 0)) break;
@@ -897,14 +896,10 @@ async function runAnalysis() {
       const fullName = (prefix ? prefix + '/' : '') + name;
       const size    = parseInt(sizeOct.trim() || '0', 8) || 0;
       offset += 512;
-      entries++;
       if ((type === '0' || type === '' || type === '\0') && size > 0 && isWantedEntry(fullName)) {
         files[fullName] = u8.slice(offset, offset + size);
       }
       offset += Math.ceil(size / 512) * 512;
-      if (entries % 50 === 0) {
-        await new Promise(r => setTimeout(r, 0));
-      }
     }
     return files;
   }
@@ -964,7 +959,7 @@ async function runAnalysis() {
     log('[INFO] Extracting relevant files...');
     let tarEntries;
     try {
-      tarEntries = await parseTar(rawBytes);
+      tarEntries = parseTar(rawBytes);
     } catch(e) {
       log(`[ERROR] Tar parse failed: ${e}`);
       document.getElementById('run-btn').disabled = false;
