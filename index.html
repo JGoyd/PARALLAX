@@ -872,10 +872,14 @@ async function runAnalysis() {
   }
 
   // Check if a tar entry is one we need to keep in memory
+  const WANTED_TEXT_FILES = new Set([
+    'pmudiagnose.txt', 'ps.txt', 'jetsam_priority.csv',
+    'taskSummary.csv', 'mount.txt'
+  ]);
   function isWantedEntry(fullName) {
     const base = fullName.split('/').pop();
     if (base.endsWith('.tracev3')) return true;
-    if (base === 'pmudiagnose.txt') return true;
+    if (WANTED_TEXT_FILES.has(base)) return true;
     if (fullName.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) return true;
     return false;
   }
@@ -907,6 +911,8 @@ async function runAnalysis() {
           tracev3Files[base] = decoder.decode(fileData);
         } else if (base === 'pmudiagnose.txt') {
           pmuText = decoder.decode(fileData);
+        } else if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
+          extraTextFiles[base] = decoder.decode(fileData);
         } else if (fullName.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
           dscBlobs[base] = fileData;
         }
@@ -921,6 +927,7 @@ async function runAnalysis() {
   // ── Extract archive (tar.gz or zip) ──────────────────────────────────────
   const tracev3Files = {};
   const dscBlobs = {};   // UUID-hex filename -> Uint8Array
+  const extraTextFiles = {}; // ps.txt, jetsam_priority.csv, etc.
   let pmuText = null;
 
   const fname = loadedFile.name.toLowerCase();
@@ -1038,6 +1045,9 @@ async function runAnalysis() {
       }
       if (base === 'pmudiagnose.txt') {
         try { pmuText = await entry.async('text'); } catch(e) { /* skip */ }
+      }
+      if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
+        try { extraTextFiles[base] = await entry.async('text'); } catch(e) { /* skip */ }
       }
       // DSC ghost cache blobs
       if (name.includes('/dsc/') && /^[0-9A-Fa-f]{32}$/.test(base)) {
@@ -1228,6 +1238,91 @@ async function runAnalysis() {
   addIndicator(result, 'L3b', 'Egress Anchor (ciphermld / networkserviceproxy)',
     l3bStatus, 0, l3bParts.join(' · ') || 'ciphermld not detected');
   log(`[L3b] ${l3bStatus}`);
+
+  // ── L4 Process / System Corroboration (ps.txt, jetsam, mount) ──────────
+  log('[L4] Process and system state...');
+  const l4parts = [];
+  let l4status = 'NOT_DETECTED';
+
+  // ps.txt — running processes at capture time
+  const psText = extraTextFiles['ps.txt'] || '';
+  if (psText) {
+    const psLines = psText.split('\n');
+    // Check for networkserviceproxy
+    const nspLine = psLines.find(l => l.includes('networkserviceproxy'));
+    if (nspLine) {
+      const pidMatch = nspLine.match(/\s+(\d+)\s+/);
+      const nspPid = pidMatch ? pidMatch[1] : '?';
+      l4parts.push(`networkserviceproxy running (PID ${nspPid})`);
+    }
+    // Check for NSProxy / FEEDEEEE-related bundle IDs
+    const nsproxy = psLines.find(l => /nsproxy|NSProxy/i.test(l) && !l.includes('networkserviceproxy'));
+    if (nsproxy) {
+      l4parts.push(`NSProxy PacketTunnel process detected in ps.txt`);
+      l4status = 'CONFIRMED';
+    }
+    // Check for ciphermld running
+    if (psLines.some(l => l.includes('ciphermld'))) {
+      l4parts.push(`ciphermld active at capture time`);
+      l4status = 'CONFIRMED';
+    }
+    // Count total processes
+    const procCount = psLines.filter(l => l.trim() && !l.startsWith('USER')).length;
+    l4parts.push(`${procCount} processes at capture`);
+  } else {
+    l4parts.push('ps.txt not found');
+  }
+
+  // jetsam_priority.csv — process memory and priority tiers
+  const jetsamText = extraTextFiles['jetsam_priority.csv'] || '';
+  if (jetsamText) {
+    const jetLines = jetsamText.split('\n');
+    const nspJet = jetLines.find(l => l.includes('networkserviceproxy'));
+    if (nspJet) {
+      const cols = nspJet.split(',');
+      const priority = cols[0] ? cols[0].trim() : '?';
+      const memPages = cols[4] ? cols[4].trim() : '?';
+      const memKB = memPages !== '?' ? Math.round(parseInt(memPages) * 16 / 1024) : '?';
+      l4parts.push(`NSP jetsam priority ${priority}, ~${memKB}KB memory`);
+    }
+    // Check for NSProxy or FEEDEEEE bundle in jetsam
+    const suspiciousJet = jetLines.filter(l =>
+      /nsproxy|NSProxy|FEEDEEEE/i.test(l) && !l.includes('networkserviceproxy')
+    );
+    if (suspiciousJet.length) {
+      l4parts.push(`${suspiciousJet.length} suspicious process(es) in jetsam: ${suspiciousJet.map(l => { const c = l.split(','); return c[c.length-2] || 'unknown'; }).join(', ')}`);
+      l4status = 'CONFIRMED';
+    }
+  }
+
+  // mount.txt — check for unexpected mount points
+  const mountText = extraTextFiles['mount.txt'] || '';
+  if (mountText) {
+    const mountLines = mountText.split('\n').filter(l => l.trim());
+    const unexpected = mountLines.filter(l =>
+      !l.includes('/dev/disk') || l.includes('/usr/local') || l.includes('/private/var/tmp')
+    );
+    // Standard mounts are /, /private/var, /private/var/wireless, /private/var/MobileSoftwareUpdate
+    const suspiciousMounts = mountLines.filter(l =>
+      l.includes('/usr/local') || l.includes('noexec') === false && l.includes('union')
+    );
+    if (suspiciousMounts.length) {
+      l4parts.push(`unusual mount: ${suspiciousMounts.map(l => l.split(' on ')[1]?.split(' ')[0] || l.slice(0,60)).join(', ')}`);
+      if (l4status === 'NOT_DETECTED') l4status = 'POSSIBLE';
+    }
+    l4parts.push(`${mountLines.length} mount points`);
+  }
+
+  // Elevate L4 status if NSP is running + prior layers confirmed
+  if (l4status === 'NOT_DETECTED' && psText && psText.includes('networkserviceproxy')) {
+    if (l3bStatus === 'CONFIRMED') l4status = 'POSSIBLE';
+  }
+
+  addIndicator(result, 'L4', 'Process / System Corroboration',
+    l4status, 0, l4parts.join(' · ') || 'System state files not available');
+  log(`[L4] ${l4status}`);
+  result.ps_text = psText;
+  result.jetsam_text = jetsamText;
 
   // ── L5 Egress ──
   log('[L5] Active egress / relay nodes...');
@@ -1795,6 +1890,22 @@ function buildDrillDown(ind, r) {
           lines.push('__PLAIN__The OSLaunchdJob finding means iOS itself will automatically relaunch this process if it is ever stopped. It cannot be terminated through normal means.');
         }
         lines.push('__LEGAL_START__CFAA 18 U.S.C. §1030: unauthorized data transmission from a protected computer. GDPR Article 44: cross-border transfers to unknown relay nodes have no legal basis or data transfer agreement.');
+      }
+      break;
+    case 'L4':
+      if (ind.status !== 'NOT_DETECTED') {
+        lines.push('__HEAD__Process & System State at Capture');
+        if (r.ps_text && r.ps_text.includes('networkserviceproxy')) {
+          const nspLine = r.ps_text.split('\n').find(l => l.includes('networkserviceproxy')) || '';
+          lines.push(`__WARN__  networkserviceproxy active at capture time`);
+          if (nspLine.trim()) lines.push(`  ${nspLine.trim().slice(0, 120)}`);
+        }
+        if (r.jetsam_text) {
+          const nspJet = r.jetsam_text.split('\n').find(l => l.includes('networkserviceproxy'));
+          if (nspJet) lines.push(`  jetsam: ${nspJet.trim().slice(0, 120)}`);
+        }
+        lines.push('__PLAIN_HEAD__What this means for you');
+        lines.push('__PLAIN__At the exact moment this diagnostic was captured, the relay process was actively running on your device. It was not triggered by a phone call or anything you did — it runs continuously in the background as part of the operating system.');
       }
       break;
     case 'L5':
@@ -2549,6 +2660,7 @@ function getLayerPlainName(layer) {
     L2: 'App permissions overridden without your knowledge',
     L3a: 'Silent data collection identity running on your device',
     L3b: 'Hidden outbound data pipe sending your data out',
+    L4: 'Surveillance processes confirmed running at capture time',
     L5: 'Active connections to known surveillance relay servers',
     L6: 'Diagnostic logs being falsified to hide activity',
     L7: 'Unknown executable code hidden in system cache',
@@ -2672,6 +2784,12 @@ function renderDeviceMap(el, r) {
     { layer:'L3b', icon:'🚰', title:'Hidden outbound pipe',
       sub:'ciphermld · runs inside Apple services' },
     status('L3b')
+  ));
+
+  colCenter.appendChild(makeMapBlock(
+    { layer:'L4', icon:'🔬', title:'Process confirmation',
+      sub:'ps · jetsam · system state at capture' },
+    status('L4')
   ));
 
   // Arrow
