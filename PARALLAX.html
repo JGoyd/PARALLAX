@@ -882,10 +882,11 @@ async function runAnalysis() {
     return false;
   }
   // Selective tar parser — only slices wanted files, skips everything else
-  function parseTar(buffer) {
+  async function parseTar(buffer) {
     const files = {};
     const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     let offset = 0;
+    let entries = 0;
     while (offset + 512 <= u8.length) {
       const header = u8.subarray(offset, offset + 512);
       if (header.every(b => b === 0)) break;
@@ -896,10 +897,14 @@ async function runAnalysis() {
       const fullName = (prefix ? prefix + '/' : '') + name;
       const size    = parseInt(sizeOct.trim() || '0', 8) || 0;
       offset += 512;
+      entries++;
       if ((type === '0' || type === '' || type === '\0') && size > 0 && isWantedEntry(fullName)) {
         files[fullName] = u8.slice(offset, offset + size);
       }
       offset += Math.ceil(size / 512) * 512;
+      if (entries % 200 === 0) {
+        await new Promise(r => setTimeout(r, 0));
+      }
     }
     return files;
   }
@@ -931,8 +936,9 @@ async function runAnalysis() {
           const end = Math.min(i + CHUNK, u8.length);
           inflator.push(u8.subarray(i, end), end === u8.length);
           if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
-          if (i % (20*1024*1024) === 0 && i > 0) {
+          if (i % (10*1024*1024) === 0 && i > 0) {
             log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} / ${sizeMB} MB`);
+            await new Promise(r => setTimeout(r, 0));
           }
         }
         rawBytes = inflator.result;
