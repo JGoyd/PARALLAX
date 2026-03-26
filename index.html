@@ -1436,7 +1436,7 @@ async function runAnalysis() {
   // Yield to let browser paint the final log messages
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   analysisResult = result;
-  renderResults(result);
+  await renderResults(result);
 
   document.getElementById('run-btn').disabled = false;
   document.getElementById('run-btn').textContent = '▶  ANALYZE';
@@ -1449,9 +1449,10 @@ function addIndicator(result, layer, name, status, count, detail) {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
-function renderResults(r) {
+async function renderResults(r) {
   const el = document.getElementById('results');
   el.innerHTML = '';
+  const _yieldRender = () => new Promise(r => requestAnimationFrame(r));
 
   // Device bar
   const dev = document.createElement('div');
@@ -1466,8 +1467,10 @@ function renderResults(r) {
 
   // ── Plain-English Summary Card ──────────────────────────────────────────
   renderSummaryCard(el, r);
+  await _yieldRender();
 
   rule(el, 'DETECTION LAYERS');
+  await _yieldRender();
 
   for (const ind of r.indicators) {
     // Build drill-down content for each layer
@@ -1610,6 +1613,8 @@ function renderResults(r) {
     el.appendChild(row);
   }
 
+  await _yieldRender();
+
   // Verdict
   const vEl = document.createElement('div');
   vEl.className = 'verdict ' + (
@@ -1625,6 +1630,8 @@ function renderResults(r) {
     sim.textContent = 'This device operates on a simulated reality.';
     el.appendChild(sim);
   }
+
+  await _yieldRender();
 
   // Device Map
   if (r.confirmed_count > 0) {
