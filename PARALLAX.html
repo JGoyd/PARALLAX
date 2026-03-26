@@ -1431,6 +1431,10 @@ async function runAnalysis() {
   else                          result.verdict = 'NO INDICATORS DETECTED — DEVICE APPEARS CLEAN';
 
   log(`[DONE] ${confirmedAfter}/8 layers confirmed — ${result.verdict}`);
+  // Force flush any pending log messages before rendering
+  _flushLog();
+  // Yield to let browser paint the final log messages
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   analysisResult = result;
   renderResults(result);
 
@@ -3022,7 +3026,8 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
   const opUUID = (IOCS.operator_uuid || '977A2253-2A8B-98F7-7FED-C8C71D5150A0').replace(/-/g,'').toUpperCase();
 
   // Yield control to browser between blobs to prevent UI freeze/crash
-  const yieldToBrowser = () => new Promise(r => setTimeout(r, 0));
+  // Use requestAnimationFrame for better scheduling than setTimeout(0)
+  const yieldToBrowser = () => new Promise(r => requestAnimationFrame(r));
 
   for (const [fname, data] of entries) {
     // Yield every blob — keeps browser responsive on large archives
@@ -3087,7 +3092,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     {
       const MAX_RUN  = 512;
       const SCAN_CAP = Math.min(data.length, 8 * 1024 * 1024);
-      const YIELD_EVERY = 2 * 1024 * 1024;
+      const YIELD_EVERY = 512 * 1024;
       let runStart = -1;
       for (let bi = 0; bi <= SCAN_CAP; bi++) {
         if (bi > 0 && bi % YIELD_EVERY === 0) await yieldToBrowser();
@@ -3167,7 +3172,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     // Scan raw bytes for sockaddr_in structs (port 443 = 0x01 0xbb)
     // Cap scan at 8 MB to prevent browser hang on huge blobs
     const scanLimit = Math.min(data.length - 6, 8 * 1024 * 1024);
-    const CHUNK = 1024 * 1024;
+    const CHUNK = 512 * 1024;
     for (let bi = 0; bi <= scanLimit; bi++) {
       if (bi > 0 && bi % CHUNK === 0) await yieldToBrowser();
       if (data[bi+4] === 0x01 && data[bi+5] === 0xbb) {
