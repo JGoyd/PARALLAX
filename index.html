@@ -854,11 +854,24 @@ async function runAnalysis() {
   document.getElementById('results').innerHTML = '';
   document.getElementById('log').textContent = '';
 
-  const log = (msg) => {
+  // Batched log — prevents DOM thrashing during heavy processing
+  let _logBuffer = [];
+  let _logFlushPending = false;
+  const _flushLog = () => {
+    if (_logBuffer.length === 0) return;
     const el = document.getElementById('log');
-    el.textContent += msg + '\n';
+    el.textContent += _logBuffer.join('\n') + '\n';
     el.scrollTop = el.scrollHeight;
-    document.getElementById('progress').textContent = msg;
+    document.getElementById('progress').textContent = _logBuffer[_logBuffer.length - 1];
+    _logBuffer = [];
+    _logFlushPending = false;
+  };
+  const log = (msg) => {
+    _logBuffer.push(msg);
+    if (!_logFlushPending) {
+      _logFlushPending = true;
+      requestAnimationFrame(_flushLog);
+    }
   };
 
   await updateIOCs();
@@ -1074,8 +1087,8 @@ async function runAnalysis() {
     if (!result.ios_build && em) result.ios_build = em[1];
   }
 
-  const all = Object.values(tracev3Files);
-  const combined = all.join('\n');
+  // REMOVED: combined = all.join('\n') — was creating a 150MB+ single string copy
+  // All scans iterate tracev3Files individually; 'combined' was never needed
 
   // ── L0 DART ──
   log('[L0] Hardware attestation...');
@@ -1178,7 +1191,7 @@ async function runAnalysis() {
   result.apps_under_collection = [...appsFound].sort();
   result.behavioral_triad_active = triadFiles.length >= 3;
   result.behavioral_triad_files = triadFiles.length;
-  const aopUnlim = all.filter(t => t.includes(IOCS.aop_buffer) && t.includes(IOCS.aop_unlimited)).length;
+  const aopUnlim = Object.values(tracev3Files).filter(t => t.includes(IOCS.aop_buffer) && t.includes(IOCS.aop_unlimited)).length;
   const l3aParts = [
     `persona-primary ${personaTotal}× across ${l3aFiles.length} files`,
   ];
@@ -3065,10 +3078,9 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     // ── Step 1: ASCII decode (capped at 4 MB for regex-based IOC matching) ──
     const DECODE_CAP = 4 * 1024 * 1024;
     const dec4 = new TextDecoder('ascii', {fatal: false});
-    const textSlice = dec4.decode(data.subarray ? data.subarray(0, Math.min(data.length, DECODE_CAP))
-                                                 : data.slice(0, Math.min(data.length, DECODE_CAP)));
-    const text      = textSlice;
-    const textLower = textSlice.toLowerCase();
+    const text = dec4.decode(data.subarray ? data.subarray(0, Math.min(data.length, DECODE_CAP))
+                                            : data.slice(0, Math.min(data.length, DECODE_CAP)));
+    const textLower = text.toLowerCase();
 
     // ── Step 2: Byte scan for printable ASCII runs — capped at 8 MB for large blobs ──
     const stringMap = {};
@@ -3135,11 +3147,14 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     const domainHarvest = {};
     {
       const DOM_RE = /[a-zA-Z0-9]([a-zA-Z0-9.\-]{1,60})\.(com|net|org|io|ai|xyz|site|app|edu|gov|biz|cc|top|icu|club)/g;
-      const allStrings = Object.keys(stringMap).join('\n');
-      let dm;
-      while ((dm = DOM_RE.exec(allStrings)) !== null) {
-        const d = dm[0].toLowerCase();
-        domainHarvest[d] = (domainHarvest[d] || 0) + 1;
+      // Iterate keys directly instead of joining into one massive string
+      for (const str of Object.keys(stringMap)) {
+        let dm;
+        DOM_RE.lastIndex = 0;
+        while ((dm = DOM_RE.exec(str)) !== null) {
+          const d = dm[0].toLowerCase();
+          domainHarvest[d] = (domainHarvest[d] || 0) + 1;
+        }
       }
     }
     entry.domain_harvest = domainHarvest;
