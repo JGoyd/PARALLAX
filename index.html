@@ -3101,11 +3101,15 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     const textLower = text.toLowerCase();
 
     // ── Step 2: Byte scan for printable ASCII runs — capped at 8 MB for large blobs ──
+    log(`[L7]   String extraction starting (${Math.min(data.length, 8*1024*1024)/1024/1024|0} MB scan)...`);
     const stringMap = {};
     {
       const MAX_RUN  = 512;
       const SCAN_CAP = Math.min(data.length, 8 * 1024 * 1024);
       const YIELD_EVERY = 512 * 1024;
+      // Pre-allocate a reusable buffer for string building — avoids O(n^2) concat
+      const runBuf = new Uint8Array(MAX_RUN);
+      const runDec = new TextDecoder('ascii', {fatal: false});
       let runStart = -1;
       for (let bi = 0; bi <= SCAN_CAP; bi++) {
         if (bi > 0 && bi % YIELD_EVERY === 0) await yieldToBrowser();
@@ -3115,8 +3119,8 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
         } else {
           if (runStart >= 0 && bi - runStart >= 6) {
             const end = Math.min(bi, runStart + MAX_RUN);
-            let s = '';
-            for (let si = runStart; si < end; si++) s += String.fromCharCode(data[si]);
+            // Single TextDecoder call on a subarray — no per-char string concat
+            const s = runDec.decode(data.subarray(runStart, end));
             if (stringMap[s]) {
               stringMap[s].count++;
             } else {
@@ -3127,6 +3131,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
         }
       }
     }
+    log(`[L7]   String extraction done: ${Object.keys(stringMap).length} unique strings`);
     const strings = Object.entries(stringMap)
       .sort((a, b) => b[1].count - a[1].count)
       .slice(0, 500)
