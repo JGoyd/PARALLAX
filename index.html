@@ -3062,25 +3062,19 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     };
 
     // ── SHA256 hash match ──────────────────────────────────────────────────
-    // Only hash if we have known-bad hashes to compare against AND blob is under 32 MB.
-    // Large DSC blobs (150-400 MB) cause browser freeze from:
-    //   1. data.buffer.slice() creating a full copy of the blob
-    //   2. crypto.subtle.digest blocking the main thread on the full buffer
-    if (knownBadHashes.size > 0 && data.length <= 32 * 1024 * 1024) {
-      try {
-        log(`[L7]   Hashing ${fname} (${(data.length/1024/1024).toFixed(1)} MB)...`);
-        // Pass the Uint8Array directly — SubtleCrypto accepts BufferSource
-        // This avoids the .buffer.slice() copy entirely
-        entry.sha256 = await sha256hex(data);
-        if (knownBadHashes.has(entry.sha256)) {
-          entry.ioc_hits.push(`HASH MATCH: ${entry.sha256.slice(0,16)}…`);
-          hashMatches.push({ fname, hash: entry.sha256 });
-          log(`[L7]   HASH MATCH: ${fname} sha256=${entry.sha256.slice(0,16)}…`);
-        }
-        log(`[L7]   Hash complete: ${entry.sha256.slice(0,16)}…`);
-      } catch(e) { /* SubtleCrypto unavailable — skip */ }
-    } else if (data.length > 32 * 1024 * 1024) {
-      log(`[L7]   Skipping SHA256 for ${fname} (${(data.length/1024/1024).toFixed(0)} MB > 32 MB cap) — byte-level scanning will still run`);
+    try {
+      log(`[L7]   Hashing ${fname} (${(data.length/1024/1024).toFixed(1)} MB)...`);
+      // Pass Uint8Array directly — no .buffer.slice() copy needed
+      entry.sha256 = await sha256hex(data);
+      await yieldToBrowser();
+      if (knownBadHashes.size > 0 && knownBadHashes.has(entry.sha256)) {
+        entry.ioc_hits.push(`HASH MATCH: ${entry.sha256.slice(0,16)}…`);
+        hashMatches.push({ fname, hash: entry.sha256 });
+        log(`[L7]   HASH MATCH: ${fname} sha256=${entry.sha256.slice(0,16)}…`);
+      }
+      log(`[L7]   Hash: ${entry.sha256.slice(0,16)}…`);
+    } catch(e) {
+      log(`[L7]   SHA256 unavailable for ${fname}: ${e.message || e}`);
     }
 
     // ── Mach-O detection ──────────────────────────────────────────────────
@@ -3158,7 +3152,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
       // Use the 4 MB text slice — UUIDs are short strings, this is fine
       const UUID_H_RE = /[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}/g;
       let um;
-      while ((um = UUID_H_RE.exec(textSlice)) !== null) {
+      while ((um = UUID_H_RE.exec(text)) !== null) {
         const u = um[0].toLowerCase();
         if (uuidHarvest[u]) uuidHarvest[u].count++;
         else uuidHarvest[u] = { count: 1, offset: um.index };
