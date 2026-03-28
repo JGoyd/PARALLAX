@@ -806,19 +806,18 @@
 // │  §1  IOC DATABASE .................. Known indicators of compromise         │
 // │  §2  STATE ......................... Global variables                       │
 // │  §3  FILE HANDLING ................. Drag/drop, file select, archive I/O    │
-// │  §4  ANALYSIS ENGINE .............. Core analysis pipeline (L0–L7)         │
+// │  §4  ANALYSIS ENGINE .............. Core analysis pipeline (L0–L6)         │
 // │      §4.1  Tar helpers                                                     │
 // │      §4.2  Archive extraction (tar.gz / zip)                               │
 // │      §4.3  Device identity parsing                                         │
 // │      §4.4  L0 — Hardware attestation (DART/ISP)                            │
-// │      §4.5  L1 — Shadow bearer / baseband                                  │
-// │      §4.6  L2 — TCC permission staging                                    │
-// │      §4.7  L3a — Collection persona                                       │
-// │      §4.8  L3b — Egress anchor (ciphermld)                                │
-// │      §4.9  L4 — Process / system corroboration                            │
-// │      §4.10 L5 — Active egress / relay nodes                               │
-// │      §4.11 L6 — Diagnostic suppression                                    │
-// │      §4.12 L7 — DSC ghost cache (cross-layer promotion)                   │
+// │      §4.5  L1 — TCC permission staging                                    │
+// │      §4.6  L2a — Collection persona                                       │
+// │      §4.7  L2b — Egress anchor (ciphermld)                                │
+// │      §4.8  L3 — Process / system corroboration + baseband                 │
+// │      §4.9  L4 — Active egress / relay nodes                               │
+// │      §4.10 L5 — Diagnostic suppression                                    │
+// │      §4.11 L6 — DSC ghost cache (cross-layer promotion)                   │
 // │      §4.13 Verdict calculation                                            │
 // │  §5  DSC GHOST CACHE ANALYZER ..... Binary blob analysis module            │
 // │  §6  RENDERING .................... Results display, drill-downs, cards     │
@@ -845,7 +844,6 @@
  * @property {string} collection_persona - Primary collection persona UUID prefix
  * @property {string} persona_alt - Alternate persona UUID
  * @property {string} persona_alt_variant - Settings-layer persona variant
- * @property {string} shadow_bearer - Baseband shadow bearer pattern
  * @property {string} rtbuddy_endpoint - AOP/baseband coprocessor log junction
  * @property {string} commcenter_xpc - CommCenter XPC telephony bridge pattern
  * @property {string} ciphermld_pid - Ciphermld process ID pattern
@@ -884,7 +882,6 @@ const IOCS = {
   collection_persona:    "FEEDEEEE-DDDD-CCCC-BBBB",
   persona_alt:           "FEEDEEEE-DDDD-CCCC-BBBB-0000000033333",
   persona_alt_variant:   "FEEDEEEE-DDDD-CCCC-BBBB-33330",
-  shadow_bearer:         "bv41",
   rtbuddy_endpoint:      "RTBuddyOSLogEndpoint",
   commcenter_xpc:        "commcenter.xpc.peer",
   ciphermld_pid:         "pid/10223 [ciphermld]",
@@ -1046,18 +1043,17 @@ function setFile(file) {
 // §4  ANALYSIS ENGINE
 // ══════════════════════════════════════════════════════════════════════════════
 // Core analysis pipeline. Decompresses the archive, parses tar/zip entries,
-// and runs detection layers L0 through L7 sequentially.
+// and runs detection layers L0 through L6 sequentially.
 //
 // Layer overview:
 //   L0  — Hardware attestation (DART/ISP co-occurrence)
-//   L1  — Shadow bearer / baseband egress
-//   L2  — TCC permission staging
-//   L3a — Collection persona / RunningBoard anchor
-//   L3b — Egress anchor (ciphermld / networkserviceproxy)
-//   L4  — Process / system state corroboration
-//   L5  — Active egress / relay mesh / digital twin
-//   L6  — Diagnostic suppression (PMU, IfSample, seymour)
-//   L7  — DSC ghost cache / binary implant analysis
+//   L1  — TCC permission staging
+//   L2a — Collection persona / RunningBoard anchor
+//   L2b — Egress anchor (ciphermld / networkserviceproxy)
+//   L3  — Process / system corroboration + baseband (IPDP, RTBuddy, CommCenter)
+//   L4  — Active egress / relay mesh / digital twin
+//   L5  — Diagnostic suppression (PMU, IfSample, seymour)
+//   L6  — DSC ghost cache / binary implant analysis
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ── Engine (JS port of engine.py) ─────────────────────────────────────────────
@@ -1091,7 +1087,7 @@ function regionAllZero(pmuText, rnum) {
 
 /**
  * Main analysis entry point. Decompresses the archive, extracts files,
- * and runs all detection layers (L0–L7). Updates the UI with results.
+ * and runs all detection layers (L0–L6). Updates the UI with results.
  * @returns {Promise<void>}
  */
 async function runAnalysis() {
@@ -1340,12 +1336,11 @@ async function runAnalysis() {
     indicators: [], apps_under_collection: [],
     ohf_nodes_found: [],
     persona_total: 0, persona_variant_total: 0,
-    bearer_total: 0,
     behavioral_triad_active: false, behavioral_triad_files: 0,
     c2_hit_counts: {}, ohf_files: [],
     rtbuddy_files: [], commcenter_files: [], launch_files: [],
     ifsample_files: [], seymour_files: [],
-    // DSC ghost cache (L7)
+    // DSC ghost cache (L6)
     dsc_blobs_found: 0, dsc_ghost_entries: [],
     dsc_non_apple_bundles: [], dsc_suspicious_paths: [],
     dsc_operator_uuids: [], dsc_embedded_domains: [],
@@ -1368,8 +1363,8 @@ async function runAnalysis() {
 
   // L0 accumulators
   let dartTotal = 0, ispTotal = 0, cooccur = 0, l0files = [];
-  // L1 accumulators
-  let bearerTotal = 0, l1files = [], ipdpFiles = [], multihopFiles = [];
+  // Baseband accumulators (folded into L3)
+  let ipdpFiles = [], multihopFiles = [];
   let rtbuddyFiles = [], commcenterFiles = [];
   // L2 accumulators
   let overrideF=[], streamF=[], walFuture=false;
@@ -1388,7 +1383,7 @@ async function runAnalysis() {
 
   const streamDecoder = new TextDecoder('utf-8', {fatal: false});
   const tracev3Names = Object.keys(tracev3Buffers);
-  // Harvested UUIDs for L7 cross-reference (collected during streaming pass)
+  // Harvested UUIDs for L6 cross-reference (collected during streaming pass)
   const harvestedUUIDs = new Set();
   const uuidHarvestRE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|[a-fA-F0-9]{32})\b/g;
 
@@ -1428,11 +1423,7 @@ async function runAnalysis() {
       }
     }
 
-    // §4.5 — L1: Shadow bearer / baseband
-    { const cnt = countIn(text, IOCS.shadow_bearer);
-      bearerTotal += cnt;
-      if (cnt) l1files.push(tvName);
-    }
+    // Baseband indicators (folded into L3)
     if (text.includes('ipdp_ip0')) ipdpFiles.push(tvName);
     if (text.includes('MultiHop')) multihopFiles.push(tvName);
     if (text.includes(IOCS.rtbuddy_endpoint)) rtbuddyFiles.push(tvName);
@@ -1500,7 +1491,7 @@ async function runAnalysis() {
       }
     }
 
-    // L7 prep: harvest UUIDs for DSC cross-reference while we have the text
+    // L6 prep: harvest UUIDs for DSC cross-reference while we have the text
     { let um;
       uuidHarvestRE.lastIndex = 0;
       while ((um = uuidHarvestRE.exec(text)) !== null) {
@@ -1522,36 +1513,20 @@ async function runAnalysis() {
     `DARTMappings ${dartTotal}×  ISP_FlushIn ${ispTotal}×  co-occurrences ${cooccur}`);
   log(`[L0] ${result.indicators[0].status}: ${cooccur} co-occurrences`);
 
-  // L1
-  log('[L1] Baseband shadow bearer...');
-  result.bearer_total = bearerTotal;
-  result.rtbuddy_files = rtbuddyFiles;
-  result.commcenter_files = commcenterFiles;
-  const l1parts = [`shadow bearer ${bearerTotal}×`];
-  if (rtbuddyFiles.length) l1parts.push(`RTBuddyOSLogEndpoint in ${rtbuddyFiles.length} files — AOP/baseband OS log junction active`);
-  if (commcenterFiles.length) l1parts.push(`CommCenter XPC telephony bridge in ${commcenterFiles.length} files`);
-  if (ipdpFiles.length) l1parts.push(`ipdp_ip0 in ${ipdpFiles.length} files`);
-  if (multihopFiles.length) l1parts.push(`MultiHop declared in ${multihopFiles.length} files`);
-  const l1status = (rtbuddyFiles.length > 0 && bearerTotal > 0) ? 'CONFIRMED' :
-    bearerTotal > 100 ? 'CONFIRMED' :
-    bearerTotal > 0 ? 'POSSIBLE' : 'NOT_DETECTED';
-  addIndicator(result, 'L1', 'Shadow Bearer / Baseband / IPDP Egress',
-    l1status, bearerTotal, l1parts.join(' · '));
-  log(`[L1] ${l1status}`);
 
-  // L2
-  log('[L2] TCC permission staging...');
+  // L1 (was L2)
+  log('[L1] TCC permission staging...');
   const l2parts = [];
   let l2status = 'NOT_DETECTED';
   if (overrideF.length) { l2parts.push(`TCCAccessGetOverride in ${overrideF.length} files`); l2status='CONFIRMED'; }
   if (streamF.length)   { l2parts.push('privacy.accounting.stream.tcc injected'); l2status='CONFIRMED'; }
   if (walFuture)        { l2parts.push('WAL future-dated entries'); }
-  addIndicator(result, 'L2', 'TCC Permission Staging', l2status, 0,
+  addIndicator(result, 'L1', 'TCC Permission Staging', l2status, 0,
     l2parts.length ? l2parts.join(' · ') : 'No TCC anomalies detected');
-  log(`[L2] ${l2status}`);
+  log(`[L1] ${l2status}`);
 
-  // L3a
-  log('[L3a] Collection persona...');
+  // L2a (was L3a)
+  log('[L2a] Collection persona...');
   result.persona_total = personaTotal;
   result.persona_variant_total = personaVariantTotal;
   result.apps_under_collection = [...appsFound].sort();
@@ -1566,13 +1541,13 @@ async function runAnalysis() {
   if (result.behavioral_triad_active) {
     l3aParts.push(`behavioral profiling triad active in ${triadFiles.length} files — pre-analyzed behavioral intelligence exfiltrated`);
   }
-  addIndicator(result, 'L3a', 'Collection Anchor (Persona / RunningBoard)',
+  addIndicator(result, 'L2a', 'Collection Anchor (Persona / RunningBoard)',
     personaTotal > 100 ? 'CONFIRMED' : personaTotal > 0 ? 'POSSIBLE' : 'NOT_DETECTED',
     personaTotal, l3aParts.join(' · '));
-  log(`[L3a] ${result.indicators[3].status}: ${personaTotal}×`);
+  log(`[L2a] ${result.indicators[2].status}: ${personaTotal}×`);
 
-  // L3b
-  log('[L3b] Egress anchor...');
+  // L2b (was L3b)
+  log('[L2b] Egress anchor...');
   result.launch_files = launchFiles;
   const l3bParts = [];
   let l3bStatus = 'NOT_DETECTED';
@@ -1580,12 +1555,12 @@ async function runAnalysis() {
   if (orFiles.length) l3bParts.push(`or-maintainer.peer[32] in ${orFiles.length} files`);
   if (gwFiles.length) { l3bParts.push(`gateway-o UUID in ${gwFiles.length} files`); l3bStatus='CONFIRMED'; }
   if (launchFiles.length) { l3bParts.push(`OSLaunchdJob launch mechanism confirmed in ${launchFiles.length} files`); l3bStatus='CONFIRMED'; }
-  addIndicator(result, 'L3b', 'Egress Anchor (ciphermld / networkserviceproxy)',
+  addIndicator(result, 'L2b', 'Egress Anchor (ciphermld / networkserviceproxy)',
     l3bStatus, 0, l3bParts.join(' · ') || 'ciphermld not detected');
-  log(`[L3b] ${l3bStatus}`);
+  log(`[L2b] ${l3bStatus}`);
 
-  // §4.9 — L4: Process / system corroboration (uses extraTextFiles, not tracev3)
-  log('[L4] Process and system state...');
+  // §4.8 — L3: Process / system corroboration + baseband (uses extraTextFiles, not tracev3)
+  log('[L3] Process and system state...');
   const l4parts = [];
   let l4status = 'NOT_DETECTED';
   const psText = extraTextFiles['ps.txt'] || '';
@@ -1618,12 +1593,19 @@ async function runAnalysis() {
   if (l4status === 'NOT_DETECTED' && psText.includes('networkserviceproxy') && l3bStatus === 'CONFIRMED') {
     l4status = 'POSSIBLE';
   }
-  addIndicator(result, 'L4', 'Process / System Corroboration',
+  // Baseband indicators (folded from old L1)
+  result.rtbuddy_files = rtbuddyFiles;
+  result.commcenter_files = commcenterFiles;
+  if (ipdpFiles.length) l4parts.push(`ipdp_ip0 in ${ipdpFiles.length} files`);
+  if (multihopFiles.length) l4parts.push(`MultiHop declared in ${multihopFiles.length} files`);
+  if (rtbuddyFiles.length) l4parts.push(`RTBuddyOSLogEndpoint in ${rtbuddyFiles.length} files`);
+  if (commcenterFiles.length) l4parts.push(`CommCenter XPC in ${commcenterFiles.length} files`);
+  addIndicator(result, 'L3', 'Process / System Corroboration',
     l4status, 0, l4parts.join(' · ') || 'System state files not available');
-  log(`[L4] ${l4status}`);
+  log(`[L3] ${l4status}`);
 
-  // L5
-  log('[L5] Active egress / relay nodes...');
+  // L4 (was L5)
+  log('[L4] Active egress / relay nodes...');
   const KNOWN_STATIC_RELAY_UUID = '1001A1D3-C12D-4D86-9475-6803804E56B6';
   let staticRelayUUIDs = [];
   for (const [uuid, fileSet] of Object.entries(kayleesUUIDMap)) {
@@ -1649,18 +1631,18 @@ async function runAnalysis() {
     }
     l5status = 'CONFIRMED';
   }
-  addIndicator(result, 'L5', 'Active Egress (Relay Mesh / Digital Twin)',
+  addIndicator(result, 'L4', 'Active Egress (Relay Mesh / Digital Twin)',
     l5status, 0, l5parts.join(' · ') || 'No relay sessions detected');
-  log(`[L5] ${l5status}`);
+  log(`[L4] ${l5status}`);
 
-  // L6
-  log('[L6] Diagnostic suppression...');
+  // L5 (was L6)
+  log('[L5] Diagnostic suppression...');
   let l6status = 'NOT_DETECTED', l6parts = [];
 
   result.ifsample_files = ifSampleFiles;
   result.seymour_files  = seymourFiles;
 
-  if (ifSampleFiles.length >= 2 && result.bearer_total > 100) {
+  if (ifSampleFiles.length >= 2 && ipdpFiles.length > 0) {
     l6parts.push(`IfSample rx-bytes 0 falsification in ${ifSampleFiles.length} files — diagnostic sampling suppressed`);
     if (l6status === 'NOT_DETECTED') l6status = 'POSSIBLE';
   }
@@ -1683,34 +1665,34 @@ async function runAnalysis() {
     if (spmiZero && pmuActive) l6parts.push('SPMI counters all zero while PMU active');
     if (!l6parts.length) l6parts = ['PMU thermal registers appear normal'];
   }
-  addIndicator(result, 'L6', 'Diagnostic Suppression',
+  addIndicator(result, 'L5', 'Diagnostic Suppression',
     l6status, 0, l6parts.join(' · '));
-  log(`[L6] ${l6status}${result.simulated_reality ? ' — This device operates on a simulated reality.' : ''}`);
+  log(`[L5] ${l6status}${result.simulated_reality ? ' — This device operates on a simulated reality.' : ''}`);
 
   // Score
   const confirmed = result.indicators.filter(i => i.status === 'CONFIRMED').length;
   result.confirmed_count = confirmed;
-  if (confirmed >= 6) result.verdict = 'SURVEILLANCE FRAMEWORK ACTIVE';
+  if (confirmed >= 5) result.verdict = 'SURVEILLANCE FRAMEWORK ACTIVE';
   else if (confirmed >= 3) result.verdict = 'INDICATORS CONFIRMED — REVIEW REQUIRED';
   else if (confirmed >= 1) result.verdict = 'SUSPICIOUS — SOME INDICATORS PRESENT';
   else result.verdict = 'NO INDICATORS DETECTED — DEVICE APPEARS CLEAN';
 
-  // ── L7 DSC Ghost Cache ──
-  // UUIDs were harvested during the streaming L0-L6 pass above (harvestedUUIDs set).
+  // ── L6 DSC Ghost Cache ──
+  // UUIDs were harvested during the streaming L0-L5 pass above (harvestedUUIDs set).
   setProgress(85, 'Analyzing DSC blobs...');
-  log(`[L7] Harvested ${harvestedUUIDs.size} UUIDs from tracev3 for DSC cross-reference`);
-  log('[L7] DSC ghost cache analysis...');
+  log(`[L6] Harvested ${harvestedUUIDs.size} UUIDs from tracev3 for DSC cross-reference`);
+  log('[L6] DSC ghost cache analysis...');
   result.dsc_blobs_found = Object.keys(dscBlobs).length;
   await analyzeDSCBlobs(dscBlobs, result, log, harvestedUUIDs);
-  log(`[L7] ${result.indicators[result.indicators.length-1]?.status || 'DONE'}`);
+  log(`[L6] ${result.indicators[result.indicators.length-1]?.status || 'DONE'}`);
 
-  // §4.12 — L7→L5 cross-layer promotion ────────────────────────────────────────────
+  // §4.11 — L6→L4 cross-layer promotion ────────────────────────────────────────────
   // DSC-extracted C2 IPs are primary forensic evidence (hardcoded in binary).
   // They should independently confirm L5 — don’t wait for a domain list match.
   const dscIPObjs = result.dsc_c2_ip_hits || [];  // [{fname, ip, note, confidence}, ...]
   const dscIPs    = [...new Set(dscIPObjs.map(o => o.ip).filter(Boolean))]; // unique IP strings
   if (dscIPs.length > 0) {
-    const l5ind = result.indicators.find(i => i.layer === 'L5');
+    const l5ind = result.indicators.find(i => i.layer === 'L4');
     if (l5ind) {
       const ipLabels = dscIPs.map(ip => {
         const attr = (IOCS.dsc_known_c2_ips || {})[ip];
@@ -1720,22 +1702,22 @@ async function runAnalysis() {
       if (l5ind.status !== 'CONFIRMED') {
         l5ind.status = 'CONFIRMED';
         l5ind.detail = promoNote + (l5ind.detail && l5ind.detail !== 'No relay sessions detected' ? ' · ' + l5ind.detail : '');
-        log(`[L5↑] Promoted to CONFIRMED via L7 DSC binary C2 IP extraction`);
+        log(`[L4↑] Promoted to CONFIRMED via L6 DSC binary C2 IP extraction`);
       } else {
         l5ind.detail += ' · ' + promoNote;
-        log(`[L5↑] DSC binary C2 IPs appended to existing CONFIRMED L5`);
+        log(`[L4↑] DSC binary C2 IPs appended to existing CONFIRMED L4`);
       }
     }
     result.dsc_promoted_c2_ips = dscIPs;  // store as plain IP strings
   }
-  // §4.13 — Verdict calculation (post L7 promotion)
+  // §4.12 — Verdict calculation (post L6 promotion)
   const confirmedAfter = result.indicators.filter(i => i.status === 'CONFIRMED').length;
-  if (confirmedAfter >= 6)      result.verdict = 'SURVEILLANCE FRAMEWORK ACTIVE';
+  if (confirmedAfter >= 5)      result.verdict = 'SURVEILLANCE FRAMEWORK ACTIVE';
   else if (confirmedAfter >= 3) result.verdict = 'INDICATORS CONFIRMED — REVIEW REQUIRED';
   else if (confirmedAfter >= 1) result.verdict = 'SUSPICIOUS — SOME INDICATORS PRESENT';
   else                          result.verdict = 'NO INDICATORS DETECTED — DEVICE APPEARS CLEAN';
 
-  log(`[DONE] ${confirmedAfter}/8 layers confirmed — ${result.verdict}`);
+  log(`[DONE] ${confirmedAfter}/7 layers confirmed — ${result.verdict}`);
   // Force flush any pending log messages before rendering
   _flushLog();
   // Yield to let browser paint the final log messages
@@ -1753,7 +1735,7 @@ async function runAnalysis() {
 /**
  * Appends a detection indicator to the result set.
  * @param {Object} result - The analysis result accumulator
- * @param {string} layer - Layer tag (e.g., 'L0', 'L1', 'L3a')
+ * @param {string} layer - Layer tag (e.g., 'L0', 'L1', 'L2a')
  * @param {string} name - Human-readable indicator name
  * @param {'CONFIRMED'|'POSSIBLE'|'NOT_DETECTED'|'ERROR'} status
  * @param {number} count - Hit count (0 if not applicable)
@@ -1928,7 +1910,6 @@ async function renderResults(r) {
   rule(el, 'KEY COUNTS');
   const counts = [
     ['Collection persona',   `${r.persona_total.toLocaleString()}×`, r.persona_total > 0],
-    ['Shadow bearer',        `${r.bearer_total.toLocaleString()}×`, r.bearer_total > 0],
     ['Operator relay nodes', String(r.ohf_nodes_found.length), r.ohf_nodes_found.length > 0],
   ];
   for (const [label, val, bad] of counts) {
@@ -1952,7 +1933,7 @@ async function renderResults(r) {
     r.verdict.includes('ACTIVE') ? 'detected' :
     r.verdict.includes('CONFIRMED') || r.verdict.includes('SUSPICIOUS') ? 'possible' : 'clean'
   );
-  vEl.textContent = `${r.verdict}  [${r.confirmed_count}/8]`;
+  vEl.textContent = `${r.verdict}  [${r.confirmed_count}/7]`;
   el.appendChild(vEl);
 
   if (r.simulated_reality) {
@@ -2105,29 +2086,8 @@ function buildDrillDown(ind, r) {
         lines.push('__LEGAL_START__GDPR Article 5 · CCPA §1798.100: accessing biometric sensors without consent is unlawful. No consent mechanism exists at the hardware level — the user was never asked.');
       }
       break;
+
     case 'L1':
-      lines.push('__HEAD__Shadow Bearer / Baseband');
-      lines.push(`  Hit count:  ${r.bearer_total.toLocaleString()}×`);
-      if ((r.rtbuddy_files||[]).length) {
-        lines.push('__HEAD__AOP/Baseband Coprocessor Junction');
-        lines.push(`__WARN__  RTBuddyOSLogEndpoint confirmed in ${r.rtbuddy_files.length} file(s)`);
-        lines.push(`  The AOP/baseband coprocessor is writing into iOS OS log infrastructure`);
-        lines.push(`  alongside shadow bearer — this is confirmation-quality evidence`);
-      }
-      if ((r.commcenter_files||[]).length) {
-        lines.push('__HEAD__CommCenter XPC Bridge');
-        lines.push(`__WARN__  commcenter.xpc.peer confirmed in ${r.commcenter_files.length} file(s)`);
-        lines.push(`  CommCenter telephony layer connected to same XPC mesh as ciphermld`);
-      }
-      lines.push(`  ipdp_ip0 = sub-OS IP data path    MultiHop = relay-assisted routing`);
-      if (ind.status === 'CONFIRMED' || ind.status === 'POSSIBLE') {
-        lines.push('__PLAIN_HEAD__What this means for you');
-        lines.push('__PLAIN__A second cellular identity has been provisioned at the baseband chip level — below iOS, invisible to your carrier. It operates as a silent parallel connection your bill and carrier logs will never show.');
-        lines.push('__PLAIN__Calls, texts, and data can be intercepted or duplicated through this bearer before reaching your real carrier\'s network.');
-        lines.push('__LEGAL_START__FCC 47 CFR §64.2001 · CALEA · ECPA 18 U.S.C. §2511: unauthorized interception of wire communications is a federal crime. A shadow bearer provisioned without consent is exactly this.');
-      }
-      break;
-    case 'L2':
       if (ind.status !== 'NOT_DETECTED') {
         lines.push('__HEAD__TCC Permission Staging');
         lines.push(`  TCCAccessGetOverride — grants permissions silently outside user prompts`);
@@ -2139,7 +2099,7 @@ function buildDrillDown(ind, r) {
         lines.push('__LEGAL_START__GDPR Article 7: consent must be freely given, specific, and informed. App Store Review Guidelines §5.1.1 require explicit user consent for all data access. CCPA §1798.120: the right to opt out of data collection has been technically removed from this device.');
       }
       break;
-    case 'L3a':
+    case 'L2a':
       lines.push('__HEAD__Collection Persona');
       lines.push(`  Primary UUID:   FEEDEEEE-DDDD-CCCC-BBBB`);
       lines.push(`  Alt UUID:       FEEDEEEE-DDDD-CCCC-BBBB-0000000033333`);
@@ -2174,7 +2134,7 @@ function buildDrillDown(ind, r) {
         lines.push('__LEGAL_START__GDPR Articles 5, 6, 22 · CCPA §1798.100 · Illinois BIPA · FTC Act §5: covert behavioral profiling without consent violates all. GDPR Article 22 grants the right not to be subject to automated profiling — removed here at the OS level.');
       }
       break;
-    case 'L3b':
+    case 'L2b':
       if (ind.status !== 'NOT_DETECTED') {
         lines.push('__HEAD__Egress Anchor — ciphermld');
         lines.push(`  PID pattern:    pid/10223 [ciphermld]`);
@@ -2195,16 +2155,16 @@ function buildDrillDown(ind, r) {
         lines.push('__LEGAL_START__CFAA 18 U.S.C. §1030: unauthorized data transmission from a protected computer. GDPR Article 44: cross-border transfers to unknown relay nodes have no legal basis or data transfer agreement.');
       }
       break;
-    case 'L4':
+    case 'L3':
       if (ind.status !== 'NOT_DETECTED') {
         lines.push('__HEAD__Process & System State at Capture');
         lines.push('__PLAIN__At the moment this diagnostic was captured, surveillance-related processes were confirmed running on the device with no user interaction.');
       }
       break;
-    case 'L5':
+    case 'L4':
       lines.push('__RELAY_VIZ__');
       break;
-    case 'L6':
+    case 'L5':
       lines.push('__HEAD__PMU Diagnostic Suppression');
       lines.push(`  Thermal regions checked:  ${IOCS.pmu_thermal_regions.join(', ')}`);
       lines.push(`  Active regions checked:   ${IOCS.pmu_active_regions.join(', ')}`);
@@ -2217,14 +2177,14 @@ function buildDrillDown(ind, r) {
       }
       if ((r.ifsample_files||[]).length >= 2) {
         lines.push('__HEAD__IfSample Falsification');
-        lines.push(`__WARN__  IfSample with rx-bytes 0 in ${r.ifsample_files.length} files while bearer active`);
+        lines.push(`__WARN__  IfSample with rx-bytes 0 in ${r.ifsample_files.length} files while IPDP baseband active`);
         lines.push(`  Network samples show zero receive bytes during active data flow`);
         lines.push(`  This is direct falsification at the diagnostic sampling layer`);
       }
       if ((r.seymour_files||[]).length >= 2) {
         lines.push('__HEAD__Suppression Cache');
         lines.push(`__WARN__  seymour codename confirmed in ${r.seymour_files.length} files`);
-        lines.push(`  Suppression subsystem cache identifier — adjacent to L6 indicators`);
+        lines.push(`  Suppression subsystem cache identifier — adjacent to L5 indicators`);
       }
       if (ind.status === 'CONFIRMED' || ind.status === 'POSSIBLE') {
         lines.push('__PLAIN_HEAD__What this means for you');
@@ -2235,7 +2195,7 @@ function buildDrillDown(ind, r) {
         lines.push('__LEGAL_START__18 U.S.C. §1519: destruction/falsification of records in a federal investigation context. GDPR Article 5(1)(f): data integrity — a system actively falsifying its own diagnostic record is per se non-compliant. This layer\'s sole purpose is to prevent detection.');
       }
       break;
-    case 'L7':
+    case 'L6':
       lines.push('__HEAD__DSC Ghost Cache — Binary Blob Analysis');
       lines.push(`  Location: system_logs.logarchive/dsc/<UUID_HEX>`);
       lines.push(`  Blobs scanned: ${r.dsc_blobs_found}`);
@@ -2995,20 +2955,19 @@ function bundleToName(bundleId) {
 
 /**
  * Returns a plain-English description for a detection layer.
- * @param {string} layer - Layer tag (e.g., 'L0', 'L3a')
+ * @param {string} layer - Layer tag (e.g., 'L0', 'L2a')
  * @returns {string}
  */
 function getLayerPlainName(layer) {
   const names = {
     L0: 'Hardware-level camera/sensor bypass (below iOS)',
-    L1: 'Secret cellular identity (shadow bearer)',
-    L2: 'App permissions overridden without your knowledge',
-    L3a: 'Silent data collection identity running on your device',
-    L3b: 'Hidden outbound data pipe sending your data out',
-    L4: 'Surveillance processes confirmed running at capture time',
-    L5: 'Active connections to known surveillance relay servers',
-    L6: 'Diagnostic logs being falsified to hide activity',
-    L7: 'Unknown executable code hidden in system cache',
+    L1: 'App permissions overridden without your knowledge',
+    L2a: 'Silent data collection identity running on your device',
+    L2b: 'Hidden outbound data pipe sending your data out',
+    L3: 'Surveillance processes confirmed running at capture time',
+    L4: 'Active connections to known surveillance relay servers',
+    L5: 'Diagnostic logs being falsified to hide activity',
+    L6: 'Unknown executable code hidden in system cache',
   };
   return names[layer] || layer;
 }
@@ -3028,13 +2987,12 @@ function buildPlainSummary(r, confirmed, possible) {
     return `${dev} returned ${possible.length} unconfirmed indicator${possible.length > 1 ? 's' : ''}. The archive may be partial. Run a full sysdiagnose and re-analyze for a complete picture.`;
   }
 
-  const hasBearer  = confirmed.some(i => i.layer === 'L1') || possible.some(i => i.layer === 'L1');
-  const hasCollect = confirmed.some(i => i.layer === 'L3a');
-  const hasEgress  = confirmed.some(i => i.layer === 'L3b');
-  const hasRelay   = confirmed.some(i => i.layer === 'L5');
+  const hasCollect = confirmed.some(i => i.layer === 'L2a');
+  const hasEgress  = confirmed.some(i => i.layer === 'L2b');
+  const hasRelay   = confirmed.some(i => i.layer === 'L4');
   const hasHW      = confirmed.some(i => i.layer === 'L0');
-  const hasSupp    = confirmed.some(i => i.layer === 'L6');
-  const hasGhost   = confirmed.some(i => i.layer === 'L7');
+  const hasSupp    = confirmed.some(i => i.layer === 'L5');
+  const hasGhost   = confirmed.some(i => i.layer === 'L6');
   const relayCount = Object.keys(r.c2_hit_counts || {}).length;
   const dscIPs     = r.dsc_promoted_c2_ips || [];
   const hasKaylees = (r.kaylees_files || []).length > 0;
@@ -3044,7 +3002,7 @@ function buildPlainSummary(r, confirmed, possible) {
   if (total >= 6) {
     opening = `${dev} shows indicators across all ${total} detection layers.`;
   } else if (total >= 3) {
-    opening = `${dev} shows confirmed indicators across ${total} of 8 detection layers.`;
+    opening = `${dev} shows confirmed indicators across ${total} of 7 detection layers.`;
   } else {
     opening = `${dev} shows ${total} confirmed indicator${total !== 1 ? 's' : ''}.`;
   }
@@ -3053,7 +3011,6 @@ function buildPlainSummary(r, confirmed, possible) {
   const findings = [];
 
   if (hasHW)      findings.push('Hardware-level sensor access detected below iOS.');
-  if (hasBearer)  findings.push('Secondary cellular identity (shadow bearer) active on baseband.');
   if (hasCollect) {
     const hits = r.persona_total > 0 ? ` (${r.persona_total.toLocaleString()} log hits)` : '';
     findings.push(`Collection persona running on device${hits}.`);
@@ -3082,9 +3039,9 @@ function buildPlainSummary(r, confirmed, possible) {
 
 /**
  * Renders the three-column device map showing the attack flow:
- *   Left:   Device internals (L0, L1, L2, L3a)
- *   Center: Exfil pipeline (L3b → L5 → Operator)
- *   Right:  Cover layer (L6, L7)
+ *   Left:   Device internals (L0, L1, L2a)
+ *   Center: Exfil pipeline (L2b → L4 → Operator)
+ *   Right:  Cover layer (L5, L6)
  *
  * @param {HTMLElement} el - Parent container
  * @param {Object} r - Analysis result
@@ -3111,9 +3068,9 @@ function renderDeviceMap(el, r) {
 
   // ── Diagram ──────────────────────────────────────────────────────────────
   // Layout: three columns
-  //   Left:   Device internals (L0, L1, L2, L3a)
-  //   Center: Exfil pipeline  (L3b → L5 → OPERATOR)
-  //   Right:  Cover layer     (L6, L7)
+  //   Left:   Device internals (L0, L1, L2a)
+  //   Center: Exfil pipeline  (L2b → L4 → OPERATOR)
+  //   Right:  Cover layer     (L5, L6)
 
   const diagram = document.createElement('div');
   diagram.className = 'dmap-diagram';
@@ -3126,9 +3083,8 @@ function renderDeviceMap(el, r) {
 
   const layers = [
     { layer:'L0', icon:'⬡', title:'Hardware access',   sub:'Camera · sensors · chip level' },
-    { layer:'L1', icon:'📡', title:'Secret cell ID',    sub:'Shadow bearer · baseband' },
-    { layer:'L2', icon:'🔓', title:'Permission bypass', sub:'TCC overridden silently' },
-    { layer:'L3a',icon:'👤', title:'Hidden identity',   sub:`Collection persona · ${r.persona_total > 0 ? r.persona_total.toLocaleString()+'× hits' : 'not seen'}` },
+    { layer:'L1', icon:'🔓', title:'Permission bypass', sub:'TCC overridden silently' },
+    { layer:'L2a',icon:'👤', title:'Hidden identity',   sub:`Collection persona · ${r.persona_total > 0 ? r.persona_total.toLocaleString()+'× hits' : 'not seen'}` },
   ];
 
   for (const cfg of layers) {
@@ -3142,29 +3098,29 @@ function renderDeviceMap(el, r) {
   colCenter.innerHTML = '<div class="dmap-col-head">Data leaving your device</div>';
 
   colCenter.appendChild(makeMapBlock(
-    { layer:'L3b', icon:'🚰', title:'Hidden outbound pipe',
+    { layer:'L2b', icon:'🚰', title:'Hidden outbound pipe',
       sub:'ciphermld · runs inside Apple services' },
-    status('L3b')
+    status('L2b')
   ));
 
   // Arrow
   const arr1 = document.createElement('div');
-  arr1.className = 'dmap-arrow' + (active('L3b') || active('L5') ? ' arrow-active' : '');
+  arr1.className = 'dmap-arrow' + (active('L2b') || active('L4') ? ' arrow-active' : '');
   arr1.textContent = '▼';
   colCenter.appendChild(arr1);
 
   const relayCount = Object.keys(r.c2_hit_counts || {}).length;
   colCenter.appendChild(makeMapBlock(
-    { layer:'L5', icon:'🌐', title:'Relay servers',
+    { layer:'L4', icon:'🌐', title:'Relay servers',
       sub: relayCount > 0
         ? `${relayCount} active node${relayCount > 1 ? 's' : ''} · ${Object.keys(r.c2_hit_counts).join(', ')}`
         : 'Onion-routing mesh · no direct hits this archive' },
-    status('L5')
+    status('L4')
   ));
 
   // Arrow to operator
   const arr2 = document.createElement('div');
-  arr2.className = 'dmap-arrow' + (active('L5') ? ' arrow-active' : '');
+  arr2.className = 'dmap-arrow' + (active('L4') ? ' arrow-active' : '');
   arr2.textContent = '▼';
   colCenter.appendChild(arr2);
 
@@ -3197,7 +3153,7 @@ function renderDeviceMap(el, r) {
   }
 
   const opBlock = document.createElement('div');
-  opBlock.className = 'dmap-block dmap-operator' + (active('L5') || active('L3b') ? ' dmap-operator-active' : '');
+  opBlock.className = 'dmap-block dmap-operator' + (active('L4') || active('L2b') ? ' dmap-operator-active' : '');
   opBlock.innerHTML = `<span class="dmap-icon">🔭</span>
     <div class="dmap-block-body">
       <div class="dmap-block-title">${opTitle}</div>
@@ -3213,14 +3169,14 @@ function renderDeviceMap(el, r) {
   colRight.innerHTML = '<div class="dmap-col-head">Hiding the evidence</div>';
 
   colRight.appendChild(makeMapBlock(
-    { layer:'L6', icon:'🪞', title:'Log falsification',
+    { layer:'L5', icon:'🪞', title:'Log falsification',
       sub:'PMU zeroed · IfSample · seymour cache' },
-    status('L6')
+    status('L5')
   ));
   colRight.appendChild(makeMapBlock(
-    { layer:'L7', icon:'👻', title:'Ghost executable',
+    { layer:'L6', icon:'👻', title:'Ghost executable',
       sub:`DSC implant · ${r.dsc_blobs_found > 0 ? r.dsc_blobs_found+' blobs scanned' : 'no blobs found'}${(r.dsc_hash_matches||[]).length ? ' · '+r.dsc_hash_matches.length+' hash match' : ''}${(r.dsc_symbol_hits||[]).length ? ' · '+r.dsc_symbol_hits.length+' symbols' : ''}` },
-    status('L7')
+    status('L6')
   ));
 
   diagram.appendChild(colRight);
@@ -3367,10 +3323,10 @@ function exportReport(r) {
       lines.push(`  UUID ${sr.uuid} — ${sr.files} files — STATIC RELAY ASSIGNMENT${isKnown?' [known IOC]':' [Whisper / unknown relay app — developer-assigned]'}`);
     }
   }
-  // L7 / DSC findings
+  // L6 / DSC findings
   if ((r.dsc_hash_matches||[]).length || (r.dsc_symbol_hits||[]).length ||
       (r.dsc_c2_ip_hits||[]).length || (r.dsc_uuid_crossrefs||[]).length) {
-    lines.push('', 'L7 — DSC GHOST CACHE / BINARY IMPLANT:', '-'.repeat(40));
+    lines.push('', 'L6 — DSC GHOST CACHE / BINARY IMPLANT:', '-'.repeat(40));
     if ((r.dsc_hash_matches||[]).length) {
       lines.push('  KNOWN-BAD SHA256 MATCHES:');
       for (const h of r.dsc_hash_matches) {
@@ -3443,7 +3399,7 @@ function exportReport(r) {
 async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
   const entries = Object.entries(blobs);
   if (entries.length === 0) {
-    addIndicator(result, 'L7', 'DSC Ghost Cache / Binary Implant',
+    addIndicator(result, 'L6', 'DSC Ghost Cache / Binary Implant',
       'NOT_DETECTED', 0, 'system_logs.logarchive/dsc/ not found or empty');
     return;
   }
@@ -3519,10 +3475,10 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     await yieldToBrowser();
 
     // Log blob size so analyst can see what's being scanned
-    log(`[L7] Scanning blob: ${fname} (${(data.length/1024/1024).toFixed(1)} MB)`);
+    log(`[L6] Scanning blob: ${fname} (${(data.length/1024/1024).toFixed(1)} MB)`);
     // Only skip truly pathological sizes (>512 MB) — real DSC blobs are 150-400 MB
     if (data.length > 512 * 1024 * 1024) {
-      log(`[L7] Skipping blob over 512 MB: ${fname}`);
+      log(`[L6] Skipping blob over 512 MB: ${fname}`);
       continue;
     }
 
@@ -3541,18 +3497,18 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
 
     // ── SHA256 hash match ──────────────────────────────────────────────────
     try {
-      log(`[L7]   Hashing ${fname} (${(data.length/1024/1024).toFixed(1)} MB)...`);
+      log(`[L6]   Hashing ${fname} (${(data.length/1024/1024).toFixed(1)} MB)...`);
       // Pass Uint8Array directly — no .buffer.slice() copy needed
       entry.sha256 = await sha256hex(data);
       await yieldToBrowser();
       if (knownBadHashes.size > 0 && knownBadHashes.has(entry.sha256)) {
         entry.ioc_hits.push(`HASH MATCH: ${entry.sha256.slice(0,16)}…`);
         hashMatches.push({ fname, hash: entry.sha256 });
-        log(`[L7]   HASH MATCH: ${fname} sha256=${entry.sha256.slice(0,16)}…`);
+        log(`[L6]   HASH MATCH: ${fname} sha256=${entry.sha256.slice(0,16)}…`);
       }
-      log(`[L7]   Hash: ${entry.sha256.slice(0,16)}…`);
+      log(`[L6]   Hash: ${entry.sha256.slice(0,16)}…`);
     } catch(e) {
-      log(`[L7]   SHA256 unavailable for ${fname}: ${e.message || e}`);
+      log(`[L6]   SHA256 unavailable for ${fname}: ${e.message || e}`);
     }
 
     // ── Mach-O detection ──────────────────────────────────────────────────
@@ -3579,7 +3535,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     const textLower = text.toLowerCase();
 
     // ── Step 2: Byte scan for printable ASCII runs — capped at 8 MB for large blobs ──
-    log(`[L7]   String extraction starting (${Math.min(data.length, 8*1024*1024)/1024/1024|0} MB scan)...`);
+    log(`[L6]   String extraction starting (${Math.min(data.length, 8*1024*1024)/1024/1024|0} MB scan)...`);
     const stringMap = {};
     {
       const MAX_RUN  = 512;
@@ -3609,7 +3565,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
         }
       }
     }
-    log(`[L7]   String extraction done: ${Object.keys(stringMap).length} unique strings`);
+    log(`[L6]   String extraction done: ${Object.keys(stringMap).length} unique strings`);
     const strings = Object.entries(stringMap)
       .sort((a, b) => b[1].count - a[1].count)
       .slice(0, 500)
@@ -3678,7 +3634,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
           const conf = knownC2IPs[ip] ? 'CRITICAL' : 'HIGH';
           entry.ioc_hits.push(`Hex-IP C2: ${ip}${note ? ' — '+note : ''}`);
           c2IPHits.push({ fname, ip, note, confidence: conf });
-          log(`[L7] Hex-IP C2 (raw): ${ip} in ${fname}`);
+          log(`[L6] Hex-IP C2 (raw): ${ip} in ${fname}`);
         }
       }
     }
@@ -3693,7 +3649,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
         const conf = knownC2IPs[ip] ? 'CRITICAL' : 'HIGH';
         entry.ioc_hits.push(`Hex-IP C2 (encoded): ${ip}${note ? ' — '+note : ''}`);
         c2IPHits.push({ fname, ip, note, confidence: conf });
-        log(`[L7] Hex-IP C2 (encoded): ${ip} in ${fname}`);
+        log(`[L6] Hex-IP C2 (encoded): ${ip} in ${fname}`);
       }
     }
 
@@ -3796,7 +3752,7 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
     if (isImplant) {
       implantBlobs.push(fname);
       entry.implant = true;
-      log(`[L7] IMPLANT: ${fname} — ${entry.macho} + ${entry.ioc_hits.length} IOC hits`);
+      log(`[L6] IMPLANT: ${fname} — ${entry.macho} + ${entry.ioc_hits.length} IOC hits`);
     }
 
     // Always push if we extracted anything meaningful — analyst decides significance
@@ -3846,8 +3802,8 @@ async function analyzeDSCBlobs(blobs, result, log, harvestedUUIDs = new Set()) {
 
   if (!parts.length) parts.push(`${entries.length} DSC blobs scanned — no ghost entries`);
 
-  log(`[L7] ${status}: ${ghostEntries.length} ghost entries · ${implantBlobs.length} implants · ${hashMatches.length} hash matches · ${symbolHits.length} symbols · ${c2IPHits.length} C2 IPs`);
-  addIndicator(result, 'L7', 'DSC Ghost Cache / Binary Implant',
+  log(`[L6] ${status}: ${ghostEntries.length} ghost entries · ${implantBlobs.length} implants · ${hashMatches.length} hash matches · ${symbolHits.length} symbols · ${c2IPHits.length} C2 IPs`);
+  addIndicator(result, 'L6', 'DSC Ghost Cache / Binary Implant',
     status, ghostEntries.length, parts.join(' · '));
 }
 
