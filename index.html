@@ -1112,7 +1112,6 @@ async function runAnalysis() {
     const el = document.getElementById('log');
     el.textContent += _logBuffer.join('\n') + '\n';
     el.scrollTop = el.scrollHeight;
-    document.getElementById('progress').textContent = _logBuffer[_logBuffer.length - 1];
     _logBuffer = [];
     _logFlushPending = false;
   };
@@ -1124,6 +1123,19 @@ async function runAnalysis() {
     }
   };
 
+  // ── Progress bar ────────────────────────────────────────────────────────────
+  const progEl = document.getElementById('progress');
+  progEl.innerHTML = '<div style="background:#2e312e;height:6px;border-radius:3px;overflow:hidden;margin-top:8px">' +
+    '<div id="prog-fill" style="background:#d98e1a;height:100%;width:0%;transition:width 0.3s ease"></div></div>' +
+    '<div id="prog-label" style="font-size:11px;color:#7a7d76;margin-top:6px"></div>';
+  const progFill  = document.getElementById('prog-fill');
+  const progLabel = document.getElementById('prog-label');
+  function setProgress(pct, label) {
+    progFill.style.width = Math.min(100, Math.max(0, pct)) + '%';
+    if (label) progLabel.textContent = label;
+  }
+
+  setProgress(2, 'Initializing...');
   await updateIOCs();
   log(`[START] ${loadedFile.name}`);
 
@@ -1185,7 +1197,10 @@ async function runAnalysis() {
   }
 
   // §4.2 — Archive extraction (tar.gz or zip) ──────────────────────────────────────
-  const tracev3Files = {};
+  // MEMORY-OPTIMIZED: tracev3 files are stored as raw Uint8Array slices and decoded
+  // one at a time during the streaming scan pass. This avoids holding all decoded
+  // text strings (2× size due to UTF-16) in memory simultaneously.
+  const tracev3Buffers = {};  // fname -> Uint8Array (raw bytes, NOT decoded strings)
   const dscBlobs = {};   // UUID-hex filename -> Uint8Array
   const extraTextFiles = {}; // ps.txt, jetsam_priority.csv, etc.
   let pmuText = null;
@@ -1198,17 +1213,13 @@ async function runAnalysis() {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
   if (isTarGz) {
-    log('[INFO] Detected tar.gz archive — decompressing...');
-    if (isMobile) log('[INFO] Mobile device detected — using memory-safe mode');
+    setProgress(5, 'Decompressing archive...');
     let rawBytes;
     try {
       // Read file into memory, check if gzip
       let u8 = new Uint8Array(await loadedFile.arrayBuffer());
       const sizeMB = (u8.length/1024/1024).toFixed(0);
-      log(`[INFO] File loaded (${sizeMB} MB compressed)`);
-
       if (u8[0] === 0x1f && u8[1] === 0x8b) {
-        log('[INFO] Decompressing...');
         const inflator = new pako.Inflate();
         // Smaller chunks on mobile to avoid memory spikes
         const CHUNK = isMobile ? 256 * 1024 : 512 * 1024;
@@ -1218,7 +1229,7 @@ async function runAnalysis() {
           inflator.push(u8.subarray(i, end), end === u8.length);
           if (inflator.err) throw new Error('Inflate: ' + inflator.msg);
           if (i % YIELD_EVERY === 0) {
-            log(`[INFO] Decompressing... ${(i/1024/1024).toFixed(0)} / ${sizeMB} MB`);
+            setProgress(5 + (i / u8.length) * 25, 'Decompressing archive...');
             await new Promise(r => setTimeout(r, 0));
           }
         }
@@ -1226,7 +1237,7 @@ async function runAnalysis() {
         // Release compressed buffer immediately — we only need the decompressed tar now
         u8 = null;
         loadedFile = null;
-        log(`[INFO] Decompressed (${(rawBytes.length/1024/1024).toFixed(0)} MB)`);
+        setProgress(30, 'Decompressed — extracting files...');
       } else {
         rawBytes = u8;
         u8 = null;
@@ -1248,7 +1259,7 @@ async function runAnalysis() {
       return;
     }
 
-    log('[INFO] Extracting relevant files...');
+    setProgress(32, 'Extracting relevant files...');
     let tarEntries;
     try {
       tarEntries = parseTar(rawBytes);
@@ -1263,14 +1274,14 @@ async function runAnalysis() {
     rawBytes = null;
 
     const entryNames = Object.keys(tarEntries);
-    log(`[INFO] tar contains ${entryNames.length} entries`);
     const decoder = new TextDecoder('utf-8', {fatal: false});
 
     for (const name of entryNames) {
       const base = name.split('/').pop();
       const data = tarEntries[name];
       if (base.endsWith('.tracev3')) {
-        tracev3Files[base] = decoder.decode(data);
+        // Store raw bytes — decoded on-demand during streaming scan
+        tracev3Buffers[base] = data;
       } else if (base === 'pmudiagnose.txt') {
         pmuText = decoder.decode(data);
       } else if (WANTED_TEXT_FILES.has(base) && base !== 'pmudiagnose.txt') {
@@ -1284,7 +1295,7 @@ async function runAnalysis() {
 
   } else {
     // ── ZIP path ────────────────────────────────────────────────────────────
-    log('[INFO] Detected ZIP archive — loading...');
+    setProgress(5, 'Reading ZIP archive...');
     let zip;
     try {
       zip = await JSZip.loadAsync(loadedFile);
@@ -1296,7 +1307,6 @@ async function runAnalysis() {
     }
 
     const allFiles = Object.keys(zip.files);
-    log(`[INFO] ZIP contains ${allFiles.length} entries`);
 
     for (const name of allFiles) {
       const entry = zip.files[name];
@@ -1304,15 +1314,9 @@ async function runAnalysis() {
       const base = name.split('/').pop();
 
       if (base.endsWith('.tracev3')) {
-        log(`[INFO] Loading ${base}…`);
         try {
-          tracev3Files[base] = await entry.async('text');
-        } catch(e) {
-          try {
-            const buf = await entry.async('uint8array');
-            tracev3Files[base] = new TextDecoder('utf-8', {fatal: false}).decode(buf);
-          } catch(e2) { /* skip */ }
-        }
+          tracev3Buffers[base] = await entry.async('uint8array');
+        } catch(e) { /* skip */ }
       }
       if (base === 'pmudiagnose.txt') {
         try { pmuText = await entry.async('text'); } catch(e) { /* skip */ }
@@ -1327,8 +1331,8 @@ async function runAnalysis() {
     }
   }
 
-  const fileCount = Object.keys(tracev3Files).length;
-  log(`[INFO] ${fileCount} tracev3 files loaded`);
+  const fileCount = Object.keys(tracev3Buffers).length;
+  setProgress(35, `Scanning ${fileCount} tracev3 files...`);
 
   const result = {
     device_model: '', soc_id: '', ios_version: '', ios_build: '',
@@ -1351,10 +1355,58 @@ async function runAnalysis() {
     verdict: '', simulated_reality: false, confirmed_count: 0
   };
 
-  // §4.3 — Device identity parsing
+  // §4.3–4.10 — STREAMING SCAN: one tracev3 at a time through ALL layers ───────────
+  // Instead of loading all tracev3 files as text strings simultaneously (which can
+  // consume 2–6 GB on real sysdiagnoses), we decode each file, run every detection
+  // layer against it, then release the string before loading the next file.
+  // Peak memory: ~1 decoded string at a time instead of all of them.
+  //
+  // All accumulators are declared here in the outer scope — identical final state.
+
   const soc_map = {T8101:'A14 Bionic',T8110:'A15 Bionic',T8120:'A16 Bionic',
                    T8130:'A17 Pro',T8140:'A18',T8150:'A18 Pro'};
-  for (const [fname, text] of Object.entries(tracev3Files)) {
+
+  // L0 accumulators
+  let dartTotal = 0, ispTotal = 0, cooccur = 0, l0files = [];
+  // L1 accumulators
+  let bearerTotal = 0, l1files = [], ipdpFiles = [], multihopFiles = [];
+  let rtbuddyFiles = [], commcenterFiles = [];
+  // L2 accumulators
+  let overrideF=[], streamF=[], walFuture=false;
+  const nextYear = String(new Date().getFullYear() + 1);
+  // L3a accumulators
+  let personaTotal = 0, personaVariantTotal = 0, l3aFiles = [], appsFound = new Set();
+  let triadFiles = [], aopUnlim = 0;
+  // L3b accumulators
+  let cmFiles=[], orFiles=[], gwFiles=[], launchFiles=[];
+  // L5 accumulators
+  let ohfFiles=[], c2Hits={}, kayleesF=[];
+  const kayleesUUIDMap = {};
+  const UUID_RE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})\b/g;
+  // L6 accumulators
+  let ifSampleFiles = [], seymourFiles = [];
+
+  const streamDecoder = new TextDecoder('utf-8', {fatal: false});
+  const tracev3Names = Object.keys(tracev3Buffers);
+  // Harvested UUIDs for L7 cross-reference (collected during streaming pass)
+  const harvestedUUIDs = new Set();
+  const uuidHarvestRE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|[a-fA-F0-9]{32})\b/g;
+
+  for (let fi = 0; fi < tracev3Names.length; fi++) {
+    const tvName = tracev3Names[fi];
+    // Decode one file at a time — this is the only large string in memory
+    const text = streamDecoder.decode(tracev3Buffers[tvName]);
+    // Release raw bytes for this file immediately — we have the string now
+    delete tracev3Buffers[tvName];
+
+    // Progress: scanning phase runs from 35% to 80%
+    const scanPct = 35 + ((fi + 1) / tracev3Names.length) * 45;
+    if (fi % 3 === 0) {
+      setProgress(scanPct, `Scanning file ${fi + 1} of ${tracev3Names.length}...`);
+      await new Promise(r => requestAnimationFrame(r));
+    }
+
+    // §4.3 — Device identity
     for (const [pat, name] of Object.entries(soc_map)) {
       if (!result.soc_id && text.includes(pat)) result.soc_id = name;
     }
@@ -1364,44 +1416,114 @@ async function runAnalysis() {
     if (!result.ios_version && vm) result.ios_version = vm[1];
     const em = text.match(/\b([0-9]{2}[A-Z][0-9]{4,6})\b/);
     if (!result.ios_build && em) result.ios_build = em[1];
-  }
 
-  // REMOVED: combined = all.join('\n') — was creating a 150MB+ single string copy
-  // All scans iterate tracev3Files individually; 'combined' was never needed
-
-  // §4.4 — L0: Hardware attestation (DART/ISP)
-  log('[L0] Hardware attestation...');
-  let dartTotal = 0, ispTotal = 0, cooccur = 0, l0files = [];
-  for (const [fname, text] of Object.entries(tracev3Files)) {
+    // §4.4 — L0: Hardware attestation (DART/ISP)
     dartTotal += countIn(text, IOCS.dart_string);
     const ispIdx = [...text.matchAll(new RegExp(IOCS.isp_string, 'g'))].map(m => m.index);
     ispTotal += ispIdx.length;
     for (const idx of ispIdx) {
       if (text.slice(idx, idx + 220).includes(IOCS.dart_string)) {
         cooccur++;
-        if (!l0files.includes(fname)) l0files.push(fname);
+        if (!l0files.includes(tvName)) l0files.push(tvName);
       }
     }
+
+    // §4.5 — L1: Shadow bearer / baseband
+    { const cnt = countIn(text, IOCS.shadow_bearer);
+      bearerTotal += cnt;
+      if (cnt) l1files.push(tvName);
+    }
+    if (text.includes('ipdp_ip0')) ipdpFiles.push(tvName);
+    if (text.includes('MultiHop')) multihopFiles.push(tvName);
+    if (text.includes(IOCS.rtbuddy_endpoint)) rtbuddyFiles.push(tvName);
+    if (text.includes(IOCS.commcenter_xpc)) commcenterFiles.push(tvName);
+
+    // §4.6 — L2: TCC permission staging
+    if (text.includes(IOCS.tcc_override)) overrideF.push(tvName);
+    if (text.includes(IOCS.tcc_stream)) streamF.push(tvName);
+    if (text.includes(nextYear)) walFuture = true;
+
+    // §4.7 — L3a: Collection persona
+    { const cnt = countIn(text, IOCS.collection_persona) + countIn(text, IOCS.persona_alt);
+      personaTotal += cnt;
+      personaVariantTotal += countIn(text, IOCS.persona_alt_variant);
+      if (cnt) {
+        l3aFiles.push(tvName);
+        for (const appPat of IOCS.collection_apps) {
+          const re = new RegExp(`${appPat.replace(/\./g,'\\.')}[\\s\\S]{0,120}${IOCS.collection_persona}`, 'g');
+          if (re.test(text)) appsFound.add(appPat);
+        }
+      }
+    }
+    // Behavioral triad — all three must appear in the same file
+    if (IOCS.behavioral_triad.every(t => text.includes(t))) {
+      triadFiles.push(tvName);
+    }
+    // AOPBufferLeech unlimited
+    if (text.includes(IOCS.aop_buffer) && text.includes(IOCS.aop_unlimited)) aopUnlim++;
+
+    // §4.8 — L3b: Egress anchor
+    if (text.includes(IOCS.ciphermld_pid) || text.includes(IOCS.ciphermld_bundle)) cmFiles.push(tvName);
+    if (text.includes(IOCS.or_maintainer)) orFiles.push(tvName);
+    if (text.includes(IOCS.gateway_o_uuid)) gwFiles.push(tvName);
+    if (text.includes(IOCS.launch_mechanism) && text.includes('networkserviceproxy')) {
+      const idx = text.indexOf(IOCS.launch_mechanism);
+      const ctx = text.slice(Math.max(0, idx - 300), idx + 300);
+      if (ctx.includes('networkserviceproxy')) launchFiles.push(tvName);
+    }
+
+    // §4.10 — L5: Active egress / relay nodes
+    if (text.includes('ObliviousHopFallback')) ohfFiles.push(tvName);
+    if (text.includes('kaylees')) {
+      kayleesF.push(tvName);
+      const lines = text.split('\n').filter(l => l.includes('kaylees'));
+      for (const ln of lines) {
+        let m;
+        UUID_RE.lastIndex = 0;
+        while ((m = UUID_RE.exec(ln)) !== null) {
+          const u = m[1].toUpperCase();
+          if (!kayleesUUIDMap[u]) kayleesUUIDMap[u] = new Set();
+          kayleesUUIDMap[u].add(tvName);
+        }
+      }
+    }
+    for (const dom of IOCS.c2_domains) {
+      if (text.includes(dom)) c2Hits[dom] = (c2Hits[dom]||0) + 1;
+    }
+
+    // §4.11 — L6: IfSample + seymour (tracev3 portion)
+    if (text.includes(IOCS.suppression_cache)) seymourFiles.push(tvName);
+    if (text.includes(IOCS.ifSample_pattern)) {
+      const idx = text.indexOf(IOCS.ifSample_pattern);
+      if (text.slice(idx, idx + 500).includes(IOCS.ifSample_zero)) {
+        ifSampleFiles.push(tvName);
+      }
+    }
+
+    // L7 prep: harvest UUIDs for DSC cross-reference while we have the text
+    { let um;
+      uuidHarvestRE.lastIndex = 0;
+      while ((um = uuidHarvestRE.exec(text)) !== null) {
+        harvestedUUIDs.add(um[1].toLowerCase().replace(/-/g,''));
+      }
+    }
+
+    // text goes out of scope here — GC can reclaim before next iteration
   }
+  setProgress(80, 'Building indicators...');
+
+  // ── Build indicators from accumulated scan results (identical logic) ─────────
+
+  // L0
+  log('[L0] Hardware attestation...');
   addIndicator(result, 'L0', 'Hardware Attestation Bypass (DART/ISP)',
     cooccur >= 3 ? 'CONFIRMED' : cooccur >= 1 ? 'POSSIBLE' : 'NOT_DETECTED',
     cooccur,
     `DARTMappings ${dartTotal}×  ISP_FlushIn ${ispTotal}×  co-occurrences ${cooccur}`);
   log(`[L0] ${result.indicators[0].status}: ${cooccur} co-occurrences`);
 
-  // §4.5 — L1: Shadow bearer / baseband
+  // L1
   log('[L1] Baseband shadow bearer...');
-  let bearerTotal = 0, l1files = [], ipdpFiles = [], multihopFiles = [];
-  let rtbuddyFiles = [], commcenterFiles = [];
-  for (const [fname, text] of Object.entries(tracev3Files)) {
-    const cnt = countIn(text, IOCS.shadow_bearer);
-    bearerTotal += cnt;
-    if (cnt) l1files.push(fname);
-    if (text.includes('ipdp_ip0')) ipdpFiles.push(fname);
-    if (text.includes('MultiHop')) multihopFiles.push(fname);
-    if (text.includes(IOCS.rtbuddy_endpoint)) rtbuddyFiles.push(fname);
-    if (text.includes(IOCS.commcenter_xpc)) commcenterFiles.push(fname);
-  }
   result.bearer_total = bearerTotal;
   result.rtbuddy_files = rtbuddyFiles;
   result.commcenter_files = commcenterFiles;
@@ -1417,16 +1539,8 @@ async function runAnalysis() {
     l1status, bearerTotal, l1parts.join(' · '));
   log(`[L1] ${l1status}`);
 
-  // §4.6 — L2: TCC permission staging
+  // L2
   log('[L2] TCC permission staging...');
-  let overrideF=[], streamF=[], walFuture=false;
-  // WAL future-date: only flag next year — avoids false positives on late-in-year dates
-  const nextYear = String(new Date().getFullYear() + 1);
-  for (const [fname, text] of Object.entries(tracev3Files)) {
-    if (text.includes(IOCS.tcc_override)) overrideF.push(fname);
-    if (text.includes(IOCS.tcc_stream)) streamF.push(fname);
-    if (text.includes(nextYear)) walFuture = true;
-  }
   const l2parts = [];
   let l2status = 'NOT_DETECTED';
   if (overrideF.length) { l2parts.push(`TCCAccessGetOverride in ${overrideF.length} files`); l2status='CONFIRMED'; }
@@ -1436,32 +1550,13 @@ async function runAnalysis() {
     l2parts.length ? l2parts.join(' · ') : 'No TCC anomalies detected');
   log(`[L2] ${l2status}`);
 
-  // §4.7 — L3a: Collection persona
+  // L3a
   log('[L3a] Collection persona...');
-  let personaTotal = 0, personaVariantTotal = 0, l3aFiles = [], appsFound = new Set();
-  let triadFiles = [];
-  for (const [fname, text] of Object.entries(tracev3Files)) {
-    const cnt = countIn(text, IOCS.collection_persona) + countIn(text, IOCS.persona_alt);
-    personaTotal += cnt;
-    personaVariantTotal += countIn(text, IOCS.persona_alt_variant);
-    if (cnt) {
-      l3aFiles.push(fname);
-      for (const appPat of IOCS.collection_apps) {
-        const re = new RegExp(`${appPat.replace(/\./g,'\\.')}[\\s\\S]{0,120}${IOCS.collection_persona}`, 'g');
-        if (re.test(text)) appsFound.add(appPat);
-      }
-    }
-    // Behavioral triad — all three must appear in the same file
-    if (IOCS.behavioral_triad.every(t => text.includes(t))) {
-      triadFiles.push(fname);
-    }
-  }
   result.persona_total = personaTotal;
   result.persona_variant_total = personaVariantTotal;
   result.apps_under_collection = [...appsFound].sort();
   result.behavioral_triad_active = triadFiles.length >= 3;
   result.behavioral_triad_files = triadFiles.length;
-  const aopUnlim = Object.values(tracev3Files).filter(t => t.includes(IOCS.aop_buffer) && t.includes(IOCS.aop_unlimited)).length;
   const l3aParts = [
     `persona-primary ${personaTotal}× across ${l3aFiles.length} files`,
   ];
@@ -1476,20 +1571,8 @@ async function runAnalysis() {
     personaTotal, l3aParts.join(' · '));
   log(`[L3a] ${result.indicators[3].status}: ${personaTotal}×`);
 
-  // §4.8 — L3b: Egress anchor (ciphermld / networkserviceproxy)
+  // L3b
   log('[L3b] Egress anchor...');
-  let cmFiles=[], orFiles=[], gwFiles=[], launchFiles=[];
-  for (const [fname, text] of Object.entries(tracev3Files)) {
-    if (text.includes(IOCS.ciphermld_pid) || text.includes(IOCS.ciphermld_bundle)) cmFiles.push(fname);
-    if (text.includes(IOCS.or_maintainer)) orFiles.push(fname);
-    if (text.includes(IOCS.gateway_o_uuid)) gwFiles.push(fname);
-    // OSLaunchdJob within 300 chars of networkserviceproxy
-    if (text.includes(IOCS.launch_mechanism) && text.includes('networkserviceproxy')) {
-      const idx = text.indexOf(IOCS.launch_mechanism);
-      const ctx = text.slice(Math.max(0, idx - 300), idx + 300);
-      if (ctx.includes('networkserviceproxy')) launchFiles.push(fname);
-    }
-  }
   result.launch_files = launchFiles;
   const l3bParts = [];
   let l3bStatus = 'NOT_DETECTED';
@@ -1501,7 +1584,7 @@ async function runAnalysis() {
     l3bStatus, 0, l3bParts.join(' · ') || 'ciphermld not detected');
   log(`[L3b] ${l3bStatus}`);
 
-  // §4.9 — L4: Process / system corroboration ──────────────────────────────────
+  // §4.9 — L4: Process / system corroboration (uses extraTextFiles, not tracev3)
   log('[L4] Process and system state...');
   const l4parts = [];
   let l4status = 'NOT_DETECTED';
@@ -1539,33 +1622,8 @@ async function runAnalysis() {
     l4status, 0, l4parts.join(' · ') || 'System state files not available');
   log(`[L4] ${l4status}`);
 
-  // §4.10 — L5: Active egress / relay nodes
+  // L5
   log('[L5] Active egress / relay nodes...');
-  let ohfFiles=[], c2Hits={}, kayleesF=[];
-  // UUID extraction from kaylees.site log entries — check for static relay assignment
-  const kayleesUUIDMap = {}; // uuid -> [fname, fname, ...]
-  const UUID_RE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})\b/g;
-  for (const [fname, text] of Object.entries(tracev3Files)) {
-    if (text.includes('ObliviousHopFallback')) ohfFiles.push(fname);
-    if (text.includes('kaylees')) {
-      kayleesF.push(fname);
-      // Extract UUIDs from lines containing kaylees
-      const lines = text.split('\n').filter(l => l.includes('kaylees'));
-      for (const ln of lines) {
-        let m;
-        UUID_RE.lastIndex = 0;
-        while ((m = UUID_RE.exec(ln)) !== null) {
-          const u = m[1].toUpperCase();
-          if (!kayleesUUIDMap[u]) kayleesUUIDMap[u] = new Set();
-          kayleesUUIDMap[u].add(fname);
-        }
-      }
-    }
-    for (const dom of IOCS.c2_domains) {
-      if (text.includes(dom)) c2Hits[dom] = (c2Hits[dom]||0) + 1;
-    }
-  }
-  // Static relay assignment: same UUID appears in 3+ independent tracev3 files
   const KNOWN_STATIC_RELAY_UUID = '1001A1D3-C12D-4D86-9475-6803804E56B6';
   let staticRelayUUIDs = [];
   for (const [uuid, fileSet] of Object.entries(kayleesUUIDMap)) {
@@ -1595,22 +1653,10 @@ async function runAnalysis() {
     l5status, 0, l5parts.join(' · ') || 'No relay sessions detected');
   log(`[L5] ${l5status}`);
 
-  // §4.11 — L6: Diagnostic suppression
+  // L6
   log('[L6] Diagnostic suppression...');
   let l6status = 'NOT_DETECTED', l6parts = [];
 
-  // Secondary L6: IfSample falsification + seymour suppression cache
-  let ifSampleFiles = [], seymourFiles = [];
-  for (const [fname, text] of Object.entries(tracev3Files)) {
-    if (text.includes(IOCS.suppression_cache)) seymourFiles.push(fname);
-    if (text.includes(IOCS.ifSample_pattern)) {
-      // Check rx-bytes 0 within 500 chars of IfSample
-      const idx = text.indexOf(IOCS.ifSample_pattern);
-      if (text.slice(idx, idx + 500).includes(IOCS.ifSample_zero)) {
-        ifSampleFiles.push(fname);
-      }
-    }
-  }
   result.ifsample_files = ifSampleFiles;
   result.seymour_files  = seymourFiles;
 
@@ -1650,20 +1696,9 @@ async function runAnalysis() {
   else result.verdict = 'NO INDICATORS DETECTED — DEVICE APPEARS CLEAN';
 
   // ── L7 DSC Ghost Cache ──
-  // Harvest all 32-char hex UUIDs from tracev3 text logs for cross-reference.
-  // IMPORTANT: create a fresh regex per file — global regexes retain lastIndex
-  // across strings and will stall/skip on subsequent iterations.
-  const harvestedUUIDs = new Set();
-  for (const text of Object.values(tracev3Files)) {
-    // Fresh non-global regex each iteration avoids lastIndex carry-over bug
-    const uuidLogRE = /\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|[a-fA-F0-9]{32})\b/g;
-    let m;
-    while ((m = uuidLogRE.exec(text)) !== null) {
-      harvestedUUIDs.add(m[1].toLowerCase().replace(/-/g,''));
-    }
-  }
+  // UUIDs were harvested during the streaming L0-L6 pass above (harvestedUUIDs set).
+  setProgress(85, 'Analyzing DSC blobs...');
   log(`[L7] Harvested ${harvestedUUIDs.size} UUIDs from tracev3 for DSC cross-reference`);
-
   log('[L7] DSC ghost cache analysis...');
   result.dsc_blobs_found = Object.keys(dscBlobs).length;
   await analyzeDSCBlobs(dscBlobs, result, log, harvestedUUIDs);
@@ -1705,8 +1740,10 @@ async function runAnalysis() {
   _flushLog();
   // Yield to let browser paint the final log messages
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  setProgress(95, 'Rendering results...');
   analysisResult = result;
   await renderResults(result);
+  setProgress(100, 'Complete');
 
   document.getElementById('run-btn').disabled = false;
   document.getElementById('run-btn').textContent = '▶  ANALYZE';
