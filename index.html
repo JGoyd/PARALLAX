@@ -425,6 +425,27 @@
     padding-left: 10px;
     margin-bottom: 5px;
   }
+  /* baseline context — "On a typical iPhone" */
+  .drill-baseline-head {
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #6a7d8a;
+    border-top: 1px solid #1e2e3e;
+    margin-top: 14px;
+    padding-top: 10px;
+    padding-bottom: 4px;
+  }
+  .drill-baseline {
+    font-size: 11px;
+    color: #8a9a8a;
+    line-height: 1.65;
+    padding: 3px 0 3px 0;
+    border-left: 2px solid #1e2e3e;
+    padding-left: 10px;
+    margin-bottom: 5px;
+    font-style: normal;
+  }
   /* legal context collapsible */
   .legal-toggle {
     display: inline-block;
@@ -1860,6 +1881,12 @@ async function renderResults(r) {
           } else if (line.startsWith('__PLAIN__')) {
             p.className = 'drill-plain';
             p.textContent = line.replace('__PLAIN__', '');
+          } else if (line.startsWith('__BASELINE_HEAD__')) {
+            p.className = 'drill-baseline-head';
+            p.textContent = line.replace('__BASELINE_HEAD__', '');
+          } else if (line.startsWith('__BASELINE__')) {
+            p.className = 'drill-baseline';
+            p.textContent = line.replace('__BASELINE__', '');
           } else if (line.startsWith('__LEGAL_START__')) {
             // Start a collapsible legal block — accumulate until __LEGAL_END__
             p.remove(); // discard the container div
@@ -1969,6 +1996,41 @@ async function renderResults(r) {
   };
   el.appendChild(copyBtn);
 
+  // ── What To Do Next guidance ────────────────────────────────────────────
+  if (r.indicators.some(i => i.status === 'CONFIRMED' || i.status === 'POSSIBLE')) {
+    const nextDiv = document.createElement('div');
+    nextDiv.style.cssText = 'margin-top:20px;padding:16px 18px;border:1px solid #2e312e;background:#1a1c1a;font-family:var(--mono);';
+
+    const nextHead = document.createElement('div');
+    nextHead.style.cssText = 'font-size:10px;letter-spacing:0.1em;color:#7b9e7b;margin-bottom:10px;';
+    nextHead.textContent = '── WHAT TO DO NEXT';
+    nextDiv.appendChild(nextHead);
+
+    const steps = [
+      ['Save your report', 'Tap EXPORT REPORT below to download a complete record of this analysis. This file is your evidence — keep it safe.'],
+      ['Do not factory reset yet', 'A factory reset destroys the evidence. If you believe your device is compromised, preserve the sysdiagnose file and this report before taking any action.'],
+      ['Run a comparison', 'If you have access to a device you trust is clean, generate a sysdiagnose on that device and run it through PARALLAX. Comparing two results side by side helps distinguish device-specific findings from system-wide patterns.'],
+      ['Understand the layers', 'Tap each detection layer above to read what was found, what is normal, and what is not. Not every indicator means compromise — context matters, and each layer explains what to look for.'],
+      ['Seek review if needed', 'If multiple layers show CONFIRMED status, consider having the exported report reviewed by a digital forensics professional or security researcher. The IOC data in the report is in a standard format that any DFIR analyst can work with.'],
+    ];
+
+    for (const [title, body] of steps) {
+      const stepDiv = document.createElement('div');
+      stepDiv.style.cssText = 'margin-bottom:10px;';
+      const stepTitle = document.createElement('div');
+      stepTitle.style.cssText = 'font-size:11px;color:#d98e1a;margin-bottom:2px;';
+      stepTitle.textContent = title;
+      stepDiv.appendChild(stepTitle);
+      const stepBody = document.createElement('div');
+      stepBody.style.cssText = 'font-size:11px;line-height:1.6;color:#8a8d86;';
+      stepBody.textContent = body;
+      stepDiv.appendChild(stepBody);
+      nextDiv.appendChild(stepDiv);
+    }
+
+    el.appendChild(nextDiv);
+  }
+
   const whatBtn = document.createElement('button');
   whatBtn.id = 'what-btn';
   whatBtn.textContent = 'WHAT IS THIS?';
@@ -2002,23 +2064,31 @@ function showWhatIsThis() {
   const sections = [
     {
       head: 'PARALLAX',
-      body: 'A forensic analysis tool for iOS sysdiagnose archives. It reads the diagnostic data your iPhone generates internally and checks it against known indicators of covert monitoring activity — things that would not show up in normal security scans.'
+      body: 'A forensic analysis tool for iOS sysdiagnose archives. It reads the diagnostic data your iPhone generates internally and checks it against known indicators of covert monitoring activity. Everything runs in your browser \u2014 nothing is uploaded, nothing leaves your device.'
     },
     {
-      head: 'WHAT IT ANALYZES',
-      body: 'You give it a sysdiagnose file (.tar.gz) generated on your iPhone. It runs entirely in your browser — no data is sent anywhere. It checks 8 layers of the operating system: hardware access, cellular identity, app permissions, data collection patterns, outbound routing, relay infrastructure, diagnostic suppression, and hidden executable code.'
+      head: 'WHAT IS A SYSDIAGNOSE?',
+      body: 'A sysdiagnose is a detailed diagnostic snapshot that iOS can generate on any iPhone. It contains system logs, process lists, power management data, network samples, and cached binary data. Apple uses it for bug reports. Security researchers use it because it captures what the operating system is actually doing at a level that apps and settings screens cannot show you.'
+    },
+    {
+      head: 'HOW IT WORKS',
+      body: 'PARALLAX scans 7 independent layers of your sysdiagnose: hardware registers, permission databases, process identity patterns, running processes, network routing, diagnostic telemetry, and binary cache. Each layer examines different data. When multiple layers independently detect the same pattern of unusual activity, the combined evidence is much stronger than any single indicator alone. This is the same cross-layer corroboration methodology used in professional digital forensics.'
     },
     {
       head: 'WHAT THE RESULTS MEAN',
-      body: 'CONFIRMED means the indicator was found clearly in your logs. POSSIBLE means it was partially present. NOT DETECTED means no evidence was found at that layer. A high confirmed count does not necessarily mean your device is compromised — it means the indicators were present. A researcher or forensic professional should review the full report before drawing conclusions.'
+      body: 'CONFIRMED means the indicator pattern was clearly present in your diagnostic data. POSSIBLE means partial evidence was found. NOT DETECTED means no evidence at that layer. Every layer includes an "On a typical iPhone" section that explains what normal looks like \u2014 tap any layer to see it. This context helps you understand whether a finding is unusual or expected for your device configuration.'
+    },
+    {
+      head: 'WHAT THIS TOOL IS NOT',
+      body: 'PARALLAX does not modify your device, install anything, or access the internet. It cannot tell you who is responsible for any activity it finds \u2014 only that the activity is present. It is an analysis tool, not a verdict. If findings are present, the exported report contains technical detail that a forensic professional can independently verify.'
     },
     {
       head: 'HOW TO GET A SYSDIAGNOSE',
-      body: 'On your iPhone: hold Volume Up + Volume Down + Side Button simultaneously for 1–2 seconds, then release. Wait 5–10 minutes. Go to Settings → Privacy → Analytics → Analytics Data and look for a file starting with “sysdiagnose”. Share it to your computer, then drop it here.'
+      body: 'On your iPhone: hold Volume Up + Volume Down + Side Button simultaneously for 1\u20132 seconds, then release. Wait 5\u201310 minutes for the diagnostic to complete. Go to Settings \u2192 Privacy & Security \u2192 Analytics & Improvements \u2192 Analytics Data and look for a file starting with "sysdiagnose". Tap it and share it to your computer (AirDrop, Files, or email to yourself). Then drop the .tar.gz file here.'
     },
     {
       head: 'QUESTIONS OR FINDINGS',
-      body: 'If you have results you want reviewed, or questions about what was found, contact the researcher directly.'
+      body: 'If you have results you want reviewed, or questions about what was found, contact the researcher directly. All indicators found by PARALLAX are based on patterns identified through real-world incident response investigations.'
     },
   ];
 
@@ -2064,8 +2134,10 @@ function rule(parent, label) {
  *   __OK__      = clean/green text
  *   __PLAIN_HEAD__ = plain-language section header
  *   __PLAIN__   = plain-language explanation
+ *   __BASELINE_HEAD__ = baseline context header ("On a typical iPhone")
+ *   __BASELINE__   = baseline context explanation
  *   __LEGAL_START__ = collapsible legal context block
- *   __RELAY_VIZ__ = placeholder for interactive relay viz (L5)
+ *   __RELAY_VIZ__ = placeholder for interactive relay viz (L4)
  *
  * @param {Object} ind - The indicator object { layer, name, status, count, detail }
  * @param {Object} r - The full analysis result
@@ -2085,6 +2157,8 @@ function buildDrillDown(ind, r) {
         lines.push('__PLAIN__There is no legitimate configuration in which DART bypass writes occur on a consumer iPhone. This is not an anomaly — it is a deliberate modification.');
         lines.push('__LEGAL_START__GDPR Article 5 · CCPA §1798.100: accessing biometric sensors without consent is unlawful. No consent mechanism exists at the hardware level — the user was never asked.');
       }
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__DARTMappings and ISP_FlushIn appear in sysdiagnose logs on all iPhones — they are part of the image signal processor pipeline. What matters is whether they co-occur within a narrow byte window (220 bytes), which indicates coordinated hardware-level access outside the normal camera stack. A stock iPhone with no unusual activity will show these strings but not in proximity.');
       break;
 
     case 'L1':
@@ -2098,6 +2172,8 @@ function buildDrillDown(ind, r) {
         lines.push('__PLAIN__The WAL future-dating finding is significant: permissions were pre-approved for requests that hadn\'t happened yet, meaning no alert would ever fire regardless of what was accessed.');
         lines.push('__LEGAL_START__GDPR Article 7: consent must be freely given, specific, and informed. App Store Review Guidelines §5.1.1 require explicit user consent for all data access. CCPA §1798.120: the right to opt out of data collection has been technically removed from this device.');
       }
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__TCC (Transparency, Consent, and Control) is the iOS permission system. On a stock device, TCCAccessGetOverride does not appear in tracev3 logs — permissions are always granted through user prompts. The presence of override entries means something wrote directly to the permission database, bypassing the prompt entirely. WAL future-dating (permissions pre-approved for dates that haven\'t happened yet) does not occur under any normal iOS configuration.');
       break;
     case 'L2a':
       lines.push('__HEAD__Collection Persona');
@@ -2133,6 +2209,9 @@ function buildDrillDown(ind, r) {
         }
         lines.push('__LEGAL_START__GDPR Articles 5, 6, 22 · CCPA §1798.100 · Illinois BIPA · FTC Act §5: covert behavioral profiling without consent violates all. GDPR Article 22 grants the right not to be subject to automated profiling — removed here at the OS level.');
       }
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__iOS uses UUIDs internally for many subsystems, but the specific pattern FEEDEEEE-DDDD-CCCC-BBBB is not part of any documented Apple framework. On devices where this UUID appears hundreds or thousands of times across multiple tracev3 files, it indicates a persistent identity tag being used to correlate activity — something stock iOS does not do at this volume or with this pattern. A clean sysdiagnose will not contain this UUID.');
+      lines.push('__BASELINE__The behavioral triad (coreduet, routined, biomesyncd) are real Apple daemons that exist on every iPhone. What matters is whether they appear in the same log context as the collection persona UUID — that co-occurrence is what distinguishes normal system activity from coordinated behavioral profiling.');
       break;
     case 'L2b':
       if (ind.status !== 'NOT_DETECTED') {
@@ -2154,15 +2233,31 @@ function buildDrillDown(ind, r) {
         }
         lines.push('__LEGAL_START__CFAA 18 U.S.C. §1030: unauthorized data transmission from a protected computer. GDPR Article 44: cross-border transfers to unknown relay nodes have no legal basis or data transfer agreement.');
       }
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__networkserviceproxy is a legitimate Apple process that handles VPN and network extension traffic. It runs on every iPhone. The indicator here is not networkserviceproxy itself — it is the presence of ciphermld (a process name styled to look like an Apple service but not part of any documented iOS framework), or-maintainer.peer[32] (an onion-routing peer address pattern), and the specific gateway UUID 316A76E0-C964-451E-8CD3-1A55755879A7. None of these appear on a stock iPhone.');
       break;
     case 'L3':
       if (ind.status !== 'NOT_DETECTED') {
         lines.push('__HEAD__Process & System State at Capture');
         lines.push('__PLAIN__At the moment this diagnostic was captured, surveillance-related processes were confirmed running on the device with no user interaction.');
+        if ((r.rtbuddy_files||[]).length) {
+          lines.push('__HEAD__Baseband Indicators');
+          lines.push(`__WARN__  RTBuddyOSLogEndpoint in ${r.rtbuddy_files.length} file(s) — AOP/baseband coprocessor writing to OS log`);
+        }
+        if ((r.commcenter_files||[]).length) {
+          lines.push(`__WARN__  CommCenter XPC bridge in ${r.commcenter_files.length} file(s) — telephony layer connected to XPC mesh`);
+        }
+        lines.push('__PLAIN_HEAD__What this means for you');
+        lines.push('__PLAIN__This layer checks what was actually running on the device at the moment the sysdiagnose was captured. If surveillance-related processes (ciphermld, NSProxy tunnels, FEEDEEEE persona entries) appear in ps.txt or jetsam_priority.csv, it means they were live — not just historical log artifacts, but active processes consuming memory and CPU time.');
       }
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__ps.txt and jetsam_priority.csv are snapshots of every running process at capture time. On a stock iPhone, you will see hundreds of Apple daemons (SpringBoard, mediaserverd, locationd, etc.). networkserviceproxy will appear if you use a VPN or Private Relay. What you should not see: ciphermld as a running process, NSProxy/PacketTunnel entries not associated with a VPN you installed, or FEEDEEEE-pattern UUIDs in jetsam memory records.');
       break;
     case 'L4':
       lines.push('__RELAY_VIZ__');
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__ObliviousHopFallback is part of Apple\'s iCloud Private Relay system. If you pay for iCloud+ and have Private Relay enabled (Settings → Apple ID → iCloud → Private Relay), seeing ObliviousHopFallback in your logs is expected and not suspicious on its own. This layer only escalates to CONFIRMED when relay traffic is routed through operator-controlled domains that are not part of Apple\'s documented relay infrastructure — domains like osbstage.twmsolution, kaylees.site, or IP addresses hardcoded in DSC binary blobs.');
+      lines.push('__BASELINE__To check: go to Settings → [your name] → iCloud → Private Relay. If it\'s ON, ObliviousHopFallback alone is normal. If it\'s OFF (or you don\'t have iCloud+) and this layer still shows hits, that is significant.');
       break;
     case 'L5':
       lines.push('__HEAD__PMU Diagnostic Suppression');
@@ -2194,6 +2289,9 @@ function buildDrillDown(ind, r) {
         }
         lines.push('__LEGAL_START__18 U.S.C. §1519: destruction/falsification of records in a federal investigation context. GDPR Article 5(1)(f): data integrity — a system actively falsifying its own diagnostic record is per se non-compliant. This layer\'s sole purpose is to prevent detection.');
       }
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__pmudiagnose.txt contains raw Power Management Unit register dumps — it records chip-level power draw, thermal activity, and SPMI bus counters. On a normally operating iPhone, thermal regions will show nonzero values because the device is generating heat (processor, screen, radios). If all thermal regions read zero while active power regions show the device is running, something is actively suppressing the thermal telemetry. This does not happen under any normal iOS configuration, including Low Power Mode or Airplane Mode.');
+      lines.push('__BASELINE__IfSample (interface sample) records are network traffic snapshots taken periodically by iOS. On a stock device, rx-bytes (received bytes) will be nonzero whenever the device has an active data connection. If rx-bytes consistently reads zero across multiple sample files while the device clearly has network activity, the sampling subsystem is being fed false data.');
       break;
     case 'L6':
       lines.push('__HEAD__DSC Ghost Cache — Binary Blob Analysis');
@@ -2276,6 +2374,9 @@ function buildDrillDown(ind, r) {
       if (r.dsc_ghost_entries.length === 0) {
         lines.push('__OK__  No ghost entries detected in DSC blobs');
       }
+      lines.push('__BASELINE_HEAD__On a typical iPhone');
+      lines.push('__BASELINE__The DSC (dyld shared cache) is a collection of pre-compiled Apple system libraries stored in /System/Library/Caches/com.apple.dyld/. In sysdiagnose archives, binary blobs in system_logs.logarchive/dsc/ are fragments of this cache. On a stock iPhone, these blobs will contain only Apple-signed code with recognized bundle IDs (com.apple.*). This layer scans for: Mach-O executables with non-Apple bundle IDs, SHA256 hashes matching known surveillance tools, symbol clusters associated with interception frameworks, and IP addresses hardcoded in big-endian sockaddr_in format (a technique used to embed C2 server addresses in compiled binaries).');
+
       // Per-blob breakdown — full methodology output
       if (r.dsc_ghost_entries.length > 0) {
         lines.push('__HEAD__Per-Blob Breakdown');
@@ -2837,14 +2938,14 @@ function renderSummaryCard(el, r) {
   // ── Severity badge ───────────────────────────────────────────────────────
   const badge = document.createElement('div');
   badge.className = 'summary-badge ' + (
-    total >= 6 ? 'badge-critical' :
+    total >= 5 ? 'badge-critical' :
     total >= 3 ? 'badge-high' :
     total >= 1 ? 'badge-medium' : 'badge-low'
   );
   badge.textContent =
-    total >= 6 ? 'CRITICAL — Surveillance Framework Active' :
-    total >= 3 ? 'HIGH — Multiple Layers Confirmed' :
-    total >= 1 ? 'MODERATE — Suspicious Activity' : 'LOW — Possible Indicators Only';
+    total >= 5 ? 'CRITICAL — Indicators across most detection layers' :
+    total >= 3 ? 'HIGH — Multiple independent layers corroborate' :
+    total >= 1 ? 'MODERATE — Indicators present in some layers' : 'LOW — Possible indicators only, not yet confirmed';
   card.appendChild(badge);
 
   // ── One-paragraph plain summary ─────────────────────────────────────────
@@ -2895,12 +2996,23 @@ function renderSummaryCard(el, r) {
     card.appendChild(list2);
   }
 
+  // ── Confidence context ──────────────────────────────────────────────────
+  if (total >= 1) {
+    const confDiv = document.createElement('div');
+    confDiv.className = 'summary-confidence';
+    confDiv.style.cssText = 'font-size:11px;line-height:1.7;color:#8a8d86;margin-top:14px;padding:10px 14px;border-left:2px solid #2e312e;';
+    if (total >= 3) {
+      confDiv.textContent = `Why this matters: PARALLAX checks 7 independent layers of the operating system — hardware, permissions, identity, processes, network, diagnostics, and binary cache. Each layer looks at different data. When ${total} of these layers independently confirm the same pattern of activity, the probability that all of them are coincidental false positives is very low. Each additional layer that corroborates makes the overall finding stronger.`;
+    } else {
+      confDiv.textContent = `This device shows ${total} confirmed indicator${total > 1 ? 's' : ''}. PARALLAX checks 7 independent layers. A single confirmed layer may have a benign explanation — tap the layer below for context on what is normal and what is not. If multiple layers confirm, the combined evidence becomes significantly stronger.`;
+    }
+    card.appendChild(confDiv);
+  }
+
   // ── Next steps hint ──────────────────────────────────────────────────────
   const hint = document.createElement('div');
   hint.className = 'summary-hint';
-  hint.textContent = total >= 3
-    ? 'Tap each layer below for details on what was found. Use EXPORT REPORT to save a full record of this analysis.'
-    : 'Tap each flagged layer for details. Use EXPORT REPORT to save the findings.';
+  hint.textContent = 'Tap each layer below for details — including what is normal and what is not. Use EXPORT REPORT to save a full record.';
   card.appendChild(hint);
 
   el.appendChild(card);
@@ -2960,14 +3072,14 @@ function bundleToName(bundleId) {
  */
 function getLayerPlainName(layer) {
   const names = {
-    L0: 'Hardware-level camera/sensor bypass (below iOS)',
-    L1: 'App permissions overridden without your knowledge',
-    L2a: 'Silent data collection identity running on your device',
-    L2b: 'Hidden outbound data pipe sending your data out',
-    L3: 'Surveillance processes confirmed running at capture time',
-    L4: 'Active connections to known surveillance relay servers',
-    L5: 'Diagnostic logs being falsified to hide activity',
-    L6: 'Unknown executable code hidden in system cache',
+    L0: 'Hardware-level sensor access detected below iOS',
+    L1: 'App permissions modified outside normal iOS prompts',
+    L2a: 'Undocumented identity pattern active on this device',
+    L2b: 'Undocumented outbound process routing data from device',
+    L3: 'Surveillance-associated processes running at capture time',
+    L4: 'Network traffic routed through undocumented relay infrastructure',
+    L5: 'Diagnostic telemetry inconsistent with device activity',
+    L6: 'Undocumented code present in system binary cache',
   };
   return names[layer] || layer;
 }
@@ -2999,10 +3111,10 @@ function buildPlainSummary(r, confirmed, possible) {
 
   // Opening line
   let opening;
-  if (total >= 6) {
-    opening = `${dev} shows indicators across all ${total} detection layers.`;
+  if (total >= 5) {
+    opening = `${dev} shows ${total} confirmed indicators across 7 independent detection layers.`;
   } else if (total >= 3) {
-    opening = `${dev} shows confirmed indicators across ${total} of 7 detection layers.`;
+    opening = `${dev} shows ${total} confirmed indicators. Multiple layers corroborate.`;
   } else {
     opening = `${dev} shows ${total} confirmed indicator${total !== 1 ? 's' : ''}.`;
   }
